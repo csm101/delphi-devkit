@@ -1,6 +1,6 @@
 pub mod compiler_state;
 pub mod macro_map;
-pub use macro_map::MacroMap;
+pub use macro_map::{IdeEnvironment, MacroMap};
 
 use super::*;
 use crate::files::dproj as dproj_cache;
@@ -486,26 +486,17 @@ impl Compiler {
                 .unwrap_or(false);
 
             let mut command = if has_dproj {
-                let args = parameters.configuration.build_arguments.join(" ");
-                let target = if parameters.rebuild { "Build" } else { "Make" };
                 let msbuild_path = find_msbuild()?;
                 let mut command = Command::new(msbuild_path);
-                command
-                    .arg(&project_file)
-                    .arg(format!("/t:Clean,{}", target))
-                    .args(args.split_whitespace())
-                    .arg(format!("/p:Config={}", eff_config))
-                    .arg(format!("/p:Configuration={}", eff_config))
-                    .arg(format!("/p:Platform={}", eff_platform))
-                    // prevent MSB60002/MSB60003 (32000-character command line limit
-                    .arg("/p:DCC_UseMSBuildExternally=true");
-                if parameters.debug_info {
-                    // Global properties override the dproj's own values, so the
-                    // debug artefacts are produced whatever the configuration says.
-                    command.args(debug_info_msbuild_properties());
-                }
-                // User passthrough last so a `/p:` override wins.
-                command.args(&self.extra_msbuild_args);
+                command.args(msbuild_arguments(
+                    &project_file.to_string_lossy(),
+                    &parameters.configuration.build_arguments,
+                    parameters.rebuild,
+                    &eff_config,
+                    &eff_platform,
+                    parameters.debug_info,
+                    &self.extra_msbuild_args,
+                ));
                 command
             } else {
                 if !self.extra_msbuild_args.is_empty() {
@@ -781,6 +772,37 @@ fn debug_info_msbuild_properties() -> Vec<String> {
     .collect()
 }
 
+/// The MSBuild command line for a `.dproj` build, in this order: the project,
+/// the target (`Clean` first, then `Make` or `Build`), the compiler
+/// configuration's own build arguments, config/platform, the debug-info
+/// overrides when asked for (global properties win over the dproj's values),
+/// and the user's passthrough arguments last — so a `/p:` property of theirs
+/// wins over everything before it, the debug-info set included (MSBuild takes
+/// the last value of a duplicated property).
+fn msbuild_arguments(
+    project_file: &str,
+    build_arguments: &[String],
+    rebuild: bool,
+    config: &str,
+    platform: &str,
+    debug_info: bool,
+    extra_msbuild_args: &[String],
+) -> Vec<String> {
+    let target = if rebuild { "Build" } else { "Make" };
+    let mut args = vec![project_file.to_string(), format!("/t:Clean,{target}")];
+    args.extend(build_arguments.join(" ").split_whitespace().map(str::to_string));
+    args.push(format!("/p:Config={config}"));
+    args.push(format!("/p:Configuration={config}"));
+    args.push(format!("/p:Platform={platform}"));
+    // prevent MSB60002/MSB60003 (32000-character command line limit)
+    args.push("/p:DCC_UseMSBuildExternally=true".to_string());
+    if debug_info {
+        args.extend(debug_info_msbuild_properties());
+    }
+    args.extend(extra_msbuild_args.iter().cloned());
+    args
+}
+
 /// Build the dcc command-line switches for a bare-source compile. There is no
 /// `.dproj` to carry configuration, so the (Debug|Release) selection is mapped
 /// onto the relevant `-$` compiler directives. `rebuild` adds `-B` to force a
@@ -789,8 +811,12 @@ fn debug_info_msbuild_properties() -> Vec<String> {
 /// take effect even on a Release configuration.
 fn dcc_arguments(config: &str, rebuild: bool, debug_info: bool) -> Vec<String> {
     let mut args = vec!["-Q".to_string()]; // quiet: suppress per-unit progress chatter
-    if rebuild {
-        args.push("-B".to_string()); // build all units, not just out-of-date ones
+    // Build all units, not just out-of-date ones. A debug-info build always
+    // does: the switches below change what goes into every DCU, and an
+    // up-to-date DCU from a Release build would be reused as is — the MSBuild
+    // path cleans first for the same reason.
+    if rebuild || debug_info {
+        args.push("-B".to_string());
     }
     if config.eq_ignore_ascii_case("Release") {
         args.push("-$O+".to_string()); // optimization on
@@ -819,19 +845,43 @@ fn dcc_arguments(config: &str, rebuild: bool, debug_info: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod compile_arguments_tests {
-    use super::{dcc_arguments, debug_info_msbuild_properties};
+    use super::{dcc_arguments, msbuild_arguments};
+
+    fn msbuild(rebuild: bool, debug_info: bool, extra: &[&str]) -> Vec<String> {
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        msbuild_arguments(r"C:\src\App.dproj", &["/v:q".to_string()], rebuild, "Release", "Win64", debug_info, &extra)
+    }
 
     #[test]
-    fn debug_info_properties_cover_the_full_artefact_set() {
-        let props = debug_info_msbuild_properties();
+    fn msbuild_debug_info_puts_the_full_artefact_set_on_the_command_line() {
+        let args = msbuild(false, true, &[]);
+        assert_eq!(args[0], r"C:\src\App.dproj");
+        assert_eq!(args[1], "/t:Clean,Make");
+        assert!(args.contains(&"/v:q".to_string()));
+        assert!(args.contains(&"/p:Config=Release".to_string()));
+        assert!(args.contains(&"/p:Platform=Win64".to_string()));
         for expected in [
             "/p:DCC_Optimize=false",
+            "/p:DCC_DebugInformation=2",
+            "/p:DCC_LocalDebugSymbols=true",
+            "/p:DCC_SymbolReferenceInfo=2",
+            "/p:DCC_GenerateStackFrames=true",
             "/p:DCC_DebugInfoInExe=true",
             "/p:DCC_RemoteDebug=true",
             "/p:DCC_MapFile=3",
         ] {
-            assert!(props.iter().any(|p| p == expected), "missing {expected}");
+            assert!(args.iter().any(|a| a == expected), "missing {expected}");
         }
+        assert!(!msbuild(false, false, &[]).iter().any(|a| a.starts_with("/p:DCC_") && a != "/p:DCC_UseMSBuildExternally=true"));
+        assert_eq!(msbuild(true, false, &[])[1], "/t:Clean,Build");
+    }
+
+    #[test]
+    fn msbuild_user_passthrough_comes_after_the_debug_info_properties() {
+        let args = msbuild(false, true, &["/p:DCC_MapFile=0", "/m"]);
+        let position = |needle: &str| args.iter().position(|a| a == needle).unwrap();
+        assert!(position("/p:DCC_MapFile=0") > position("/p:DCC_MapFile=3"));
+        assert_eq!(args.last().map(String::as_str), Some("/m"));
     }
 
     #[test]
@@ -841,6 +891,13 @@ mod compile_arguments_tests {
             assert!(args.iter().any(|a| a == expected), "missing {expected}");
         }
         assert_eq!(args.iter().filter(|a| *a == "-V").count(), 1);
+    }
+
+    #[test]
+    fn dcc_debug_info_rebuilds_every_unit_even_without_rebuild() {
+        assert!(dcc_arguments("Debug", false, true).contains(&"-B".to_string()));
+        assert!(!dcc_arguments("Debug", false, false).contains(&"-B".to_string()));
+        assert!(dcc_arguments("Debug", true, false).contains(&"-B".to_string()));
     }
 
     #[test]
