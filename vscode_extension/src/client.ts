@@ -124,6 +124,12 @@ export interface DelphiLspConfigResult {
 }
 
 /** Mirrors `ddk_core::debug_target::DebugTarget` — the reply of `debug/target`. */
+/** The reply to `projects/compile`: the build's outcome, once it has run. */
+export interface CompileOutcome {
+    success: boolean;
+    cancelled: boolean;
+}
+
 export interface DebugTarget {
     project_id: number | null;
     project: string;
@@ -278,51 +284,53 @@ export class DDK_Client {
      *  `.rsm`, detailed `.map`) whatever the build configuration says — see
      *  `CompileProjectParams::debug_info` in `core/src/lsp_types.rs`. */
     public async compileProject(rebuild: boolean, projectId: number, projectLinkId?: number, debugInfo: boolean = false): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+        return await this.compile({
             type: 'Project',
             project_id: projectId,
             project_link_id: projectLinkId,
             rebuild: rebuild,
             debug_info: debugInfo,
-            event_id: event,
         });
-        return await Runtime.waitForEvent(event);
     }
 
     public async compileAllInWorkspace(rebuild: boolean, workspaceId: number, debugInfo: boolean = false): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+        return await this.compile({
             type: 'AllInWorkspace',
             workspace_id: workspaceId,
             rebuild: rebuild,
             debug_info: debugInfo,
-            event_id: event,
         });
-        return await Runtime.waitForEvent(event);
     }
 
     public async compileAllInGroupProject(rebuild: boolean, debugInfo: boolean = false): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+        return await this.compile({
             type: 'AllInGroupProject',
             rebuild: rebuild,
             debug_info: debugInfo,
-            event_id: event,
         });
-        return await Runtime.waitForEvent(event);
     }
 
     public async compileFromLink(rebuild: boolean, linkId: number, debugInfo: boolean = false): Promise<boolean> {
-        const event = Runtime.addEvent(0);
-        await this.client.sendRequest('projects/compile', {
+        return await this.compile({
             type: 'FromLink',
             project_link_id: linkId,
             rebuild: rebuild,
             debug_info: debugInfo,
-            event_id: event
         });
-        return await Runtime.waitForEvent(event);
+    }
+
+    /**
+     * Runs one `projects/compile` request and resolves to whether the build
+     * succeeded. The server answers only once the compiler is done, and its
+     * reply carries the outcome; the event only keeps the request's lifetime
+     * visible to `Runtime` (it cannot fail a compile: the server finishes it
+     * whatever the compiler said).
+     */
+    private async compile(params: Record<string, unknown>): Promise<boolean> {
+        const event = Runtime.addEvent(0);
+        const outcome: CompileOutcome = await this.client.sendRequest('projects/compile', { ...params, event_id: event });
+        await Runtime.waitForEvent(event);
+        return outcome.success;
     }
 
     public async cancelCompilation(): Promise<void> {
@@ -343,8 +351,11 @@ export class DDK_Client {
     /** Thin wrapper over the `debug/target` custom method. `project` is a project id
      *  (as a string), name, or path — omit to target the currently active project.
      *  Throws (with the candidate list as the message) when the reference is ambiguous. */
-    public async debugTarget(project?: string, compiler?: string): Promise<DebugTarget> {
-        return await this.client.sendRequest('debug/target', { project, compiler });
+    /** `config`/`platform` describe those instead of the project's active
+     *  ones — the same overrides `ddk debug-target` and `ddk compile` take;
+     *  nothing is persisted. */
+    public async debugTarget(project?: string, compiler?: string, config?: string, platform?: string): Promise<DebugTarget> {
+        return await this.client.sendRequest('debug/target', { project, compiler, config, platform });
     }
 
     public onCompilerProgress(params: CompilerProgressParams) {

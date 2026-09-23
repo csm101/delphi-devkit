@@ -35,8 +35,11 @@ export class DebugFeature implements Feature {
 
   public async initialize(): Promise<void> {
     Runtime.extension.subscriptions.push(
-      commands.registerCommand(DEBUG.COMMAND.GET_DEBUG_TARGET, (args?: { project?: string; compiler?: string }) =>
-        Runtime.client.debugTarget(args?.project, args?.compiler)),
+      commands.registerCommand(
+        DEBUG.COMMAND.GET_DEBUG_TARGET,
+        (args?: { project?: string; compiler?: string; config?: string; platform?: string }) =>
+          Runtime.client.debugTarget(args?.project, args?.compiler, args?.config, args?.platform)
+      ),
       extensions.onDidChange(() => this.updateAvailability()),
       { dispose: () => this.unregister() }
     );
