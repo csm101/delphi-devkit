@@ -76,6 +76,7 @@ ddk delphilsp-config <PATH> -c "Delphi 12"   # ...choosing the compiler for an u
 ddk delphilsp-config <PATH> -o <FILE>  # ...writing somewhere else instead of next to the project
 ddk debug-target                       # Describe the active project's debug target (exe/host, symbols, sources, args)
 ddk debug-target <ID|NAME|PATH> --json # ...for a specific project, as JSON for a debugger integration
+ddk debug-target <ID|NAME> --config Release --platform Win64  # ...as that configuration/platform would build it
 ddk env                                # Show active project & compiler info
 ddk info                               # Print the DDK README
 ddk --json <command>                   # Output as JSON
@@ -102,8 +103,16 @@ Debugging* actions) forces the full debug artefact set a debugger needs —
 optimizations off, TD32 debug info in the binary, the `.rsm` remote-debug
 symbols and a detailed `.map` — regardless of what the selected build
 configuration says, so a Release build can be debugged without editing the
-project. The overrides are passed as MSBuild global properties (`/p:DCC_*`), or
-as extra `dcc` switches for a bare `.dpr`/`.dpk`; the dproj is never modified.
+project; the dproj is never modified. For a `.dproj` the flag passes exactly
+these MSBuild global properties: `DCC_Optimize=false`,
+`DCC_DebugInformation=2`, `DCC_LocalDebugSymbols=true`,
+`DCC_SymbolReferenceInfo=2`, `DCC_GenerateStackFrames=true`,
+`DCC_DebugInfoInExe=true`, `DCC_RemoteDebug=true`, `DCC_MapFile=3`. They go
+*before* anything passed after `--`, so a `/p:DCC_*` override of yours still
+wins. A bare `.dpr`/`.dpk` gets the `dcc` switches `-$O- -$D+ -$L+ -$Y+ -V -VN
+-VR -GD`, plus `-B` so every unit is rebuilt with them (the MSBuild path cleans
+first for the same reason: an up-to-date DCU from a Release build would
+otherwise be reused as is).
 
 `ddk compile --json` (and the MCP compile tools) return a fully machine-coded
 result: structured header fields (`project`, `project_path`, `compiler`,
@@ -274,9 +283,13 @@ compiler's `source` tree — only existing directories, macros expanded through
 `rsvars.bat` and the IDE's environment-variable overrides), the run arguments
 exactly as `Run` passes them, config/platform/bitness, and warnings about
 what is missing or stale (no `.rsm`, a `.map` older than the binary, a package
-that was never built). Nothing is written or compiled. The target resolves
-like `ddk compile`: an ID, a name, or a path (ad-hoc when the path belongs to
-no workspace, `-c` picks its compiler). `--json` is the form a debugger
+that was never built, an unreadable dproj or `rsvars.bat` — every input that
+could not be used is reported, so an empty list really means ready). Nothing
+is written or compiled. The target resolves like `ddk compile`: an ID, a name,
+or a path (ad-hoc when the path belongs to no workspace, `-c` picks its
+compiler), and `--config`/`--platform` describe that configuration and
+platform instead of the project's active ones — the same overrides `compile`
+takes, so what is described is what such a build produces. `--json` is the form a debugger
 integration consumes: a debug adapter's extension maps it onto its own launch
 attributes, so a hand-written launch configuration shrinks to a project
 reference and stays correct when the project's paths change. The same is

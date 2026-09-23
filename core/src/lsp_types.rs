@@ -317,12 +317,25 @@ pub struct DprojMetadataResponse {
 /// Request params for `debug/target` – asks the server to describe a
 /// project's debug target (see `ddk_core::debug_target`). Mirrors
 /// `cmd_debug_target`: `project` is an id, a name or a project-file path,
-/// `None` for the active project; `compiler` only matters for an ad-hoc path.
+/// `None` for the active project; `compiler` only matters for an ad-hoc path;
+/// `config`/`platform` describe those instead of the project's active ones.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DebugTargetParams {
     pub project: Option<String>,
     pub compiler: Option<String>,
+    pub config: Option<String>,
+    pub platform: Option<String>,
+}
+
+/// The reply to `projects/compile`, once the build has run: the request is
+/// answered only when the compiler is done, so a caller that must not go on
+/// after a failed build (a debug session, say) reads `success` here rather
+/// than inferring it from the progress events.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct CompileOutcome {
+    pub success: bool,
+    pub cancelled: bool,
 }
 
 /// Request params for `delphilsp/generate` – asks the server to (re)write the

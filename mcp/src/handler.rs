@@ -280,11 +280,15 @@ pub struct GenerateDelphiLspConfigArgs {
         its symbols and .dcp, the source search paths (project directory, dproj unit/include paths, the \
         IDE's Library and Browsing Paths, the compiler's source tree), the run arguments (dproj Run \
         Parameters fused with the saved Start Parameters), config/platform/bitness, and warnings about \
-        missing or stale artefacts. Use it to build a debugger launch or attach configuration, or to \
-        check that a project is ready to debug (an empty warnings list means it is). \
-        Target it with `project`: a numeric ID, a project name, or a path to a .dproj/.dpr/.dpk. \
+        missing or stale artefacts — and about every input that could not be read (an unparsable \
+        dproj, a missing rsvars.bat), so an empty warnings list means the project is ready to debug. \
+        Use it to build a debugger launch or attach configuration, or to check that readiness. \
+        Target it with `project`: a numeric ID, a project name, or a path to a .dproj/.dpr/.dpk \
+        (`project_id` is also accepted for an exact numeric target). \
         A name matching several projects returns the candidate list instead. \
-        Omit `project` to describe the currently active project. \
+        Omit both to describe the currently active project. \
+        `config`/`platform` describe that configuration and platform instead of the project's \
+        active ones — the same overrides the compile tools take; nothing is persisted. \
         A path that belongs to no workspace is described ad-hoc: pick its compiler with `compiler` \
         (an exact key like \"12.0\" or a product name like \"Delphi 12\"; default: newest installed). \
         Nothing is written or compiled: compile with debug_info first if the warnings ask for it."
@@ -292,11 +296,20 @@ pub struct GenerateDelphiLspConfigArgs {
 #[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
 pub struct GetDebugTargetArgs {
     /// Project to describe: a numeric ID, a project name, or a path to a
-    /// .dproj/.dpr/.dpk. Omit to use the currently active project.
+    /// .dproj/.dpr/.dpk. Omit to use the currently active project. Takes
+    /// precedence over project_id.
     pub project: Option<String>,
+    /// Numeric project ID, as an alternative to `project`.
+    pub project_id: Option<u64>,
     /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12"), used only
     /// for a file path that belongs to no workspace. Optional.
     pub compiler: Option<String>,
+    /// Build configuration to describe (e.g. "Debug", "Release") instead of
+    /// the project's active one. Optional; nothing is persisted.
+    pub config: Option<String>,
+    /// Target platform to describe (e.g. "Win32", "Win64") instead of the
+    /// project's active one. Optional; nothing is persisted.
+    pub platform: Option<String>,
 }
 
 rust_mcp_sdk::tool_box!(DdkTools, [
@@ -570,9 +583,17 @@ async fn format_file(args: &Value) -> String {
 }
 
 async fn get_debug_target(args: &Value) -> String {
-    let project = args.get("project").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let compiler = args.get("compiler").and_then(|v| v.as_str()).map(|s| s.to_string());
-    match commands::cmd_debug_target(project, compiler).await {
+    // `project` (name, id or path) takes precedence; fall back to a numeric
+    // `project_id`, and accept a bare number under `project` as an id too.
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|id| id.to_string())))
+        .or_else(|| args.get("project_id").and_then(|v| v.as_u64()).map(|id| id.to_string()));
+    let optional_string = |name: &str| args.get(name).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let compiler = optional_string("compiler");
+    let config = optional_string("config");
+    let platform = optional_string("platform");
+    match commands::cmd_debug_target(project, compiler, config, platform).await {
         Ok(commands::DebugTargetOrAmbiguity::Target(target)) => {
             serde_json::to_string_pretty(&target).unwrap_or_else(|_| target.to_string())
         }

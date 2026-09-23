@@ -21,15 +21,21 @@ impl DelphiLsp {
         return DelphiLsp { client }
     }
 
+    /// Answers once the build has run, with its outcome: a caller that must
+    /// not proceed after a failed build reads `success` from the reply.
     async fn projects_compile(
         &self,
         params: CompileProjectParams,
-    ) -> tower_lsp::jsonrpc::Result<()> {
-        if let Err(e) = Compiler::new(self.client.clone(), &params).await.compile().await {
-            lsp_error!(self.client, "Failed to compile project: {}", e);
-            NotifyError::notify(&self.client, format!("Failed to compile project: {}", e), None).await;
-        }
-        try_finish_event!(self.client, params);
+    ) -> tower_lsp::jsonrpc::Result<ddk_core::lsp_types::CompileOutcome> {
+        let outcome = match Compiler::new(self.client.clone(), &params).await.compile().await {
+            Ok(result) => ddk_core::lsp_types::CompileOutcome { success: result.success, cancelled: result.cancelled },
+            Err(e) => {
+                lsp_error!(self.client, "Failed to compile project: {}", e);
+                NotifyError::notify(&self.client, format!("Failed to compile project: {}", e), None).await;
+                ddk_core::lsp_types::CompileOutcome { success: false, cancelled: false }
+            }
+        };
+        try_finish_event!(self.client, params, Ok(outcome));
     }
 
     async fn projects_compile_cancel(
@@ -139,7 +145,7 @@ impl DelphiLsp {
         &self,
         params: ddk_core::lsp_types::DebugTargetParams,
     ) -> tower_lsp::jsonrpc::Result<ddk_core::debug_target::DebugTarget> {
-        match ddk_core::commands::cmd_debug_target(params.project, params.compiler).await {
+        match ddk_core::commands::cmd_debug_target(params.project, params.compiler, params.config, params.platform).await {
             Ok(ddk_core::commands::DebugTargetOrAmbiguity::Target(target)) => Ok(target),
             Ok(ddk_core::commands::DebugTargetOrAmbiguity::Ambiguity(ambiguity)) => {
                 Err(jsonrpc::Error::invalid_params(ambiguity.to_string()))

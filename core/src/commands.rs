@@ -1279,27 +1279,8 @@ pub async fn cmd_compile_file_with_progress(
     }
 
     // Ad-hoc: the file is not part of any managed project.
-    if !std::path::Path::new(&file_path).exists() {
-        bail!("File not found: {file_path}");
-    }
-    let compiler_key = resolve_compiler_key(compiler).await?;
-
-    // Assemble the ephemeral, non-persisted project state.
-    let mut data = ProjectsData::default();
-    data.new_workspace(&"ad-hoc".to_string(), &compiler_key).await?;
-    let workspace_id = data.workspaces[0].id;
-    let ide_env = data.ide_environment_for_workspace(workspace_id).await;
-    data.new_project(&file_path, workspace_id, &ide_env)?;
-    let project = data
-        .projects
-        .last_mut()
-        .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
-    if config.is_some() {
-        project.active_configuration = config;
-    }
-    if platform.is_some() {
-        project.active_platform = platform;
-    }
+    let data = adhoc_project_data(&file_path, compiler, config, platform).await?;
+    let project = data.projects.last().expect("adhoc_project_data holds the project");
     let project_id = project.id;
     let project_name = project.name.clone();
     let link_id = find_project_link_id(&data, project_id)
@@ -1652,11 +1633,16 @@ pub enum DebugTargetOrAmbiguity {
 /// `.dproj`/`.dpr`/`.dpk`; `None` targets the active project. A path owned by
 /// no managed project is described ad-hoc (nothing is persisted), building
 /// with `compiler` (an exact key or product name; default: the newest
-/// installed). A reference matching several projects returns the candidate
-/// list instead.
+/// installed). `config`/`platform` describe that configuration and platform
+/// instead of the project's active ones — the same overrides `compile`
+/// takes, so the artefacts described are the ones such a build produces;
+/// nothing is persisted either way. A reference matching several projects
+/// returns the candidate list instead.
 pub async fn cmd_debug_target(
     reference: Option<String>,
     compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
 ) -> Result<DebugTargetOrAmbiguity> {
     let data = PROJECTS_DATA.read().await;
     let project_id = match &reference {
@@ -1674,7 +1660,8 @@ pub async fn cmd_debug_target(
             }
             ProjectResolution::NotFound => {
                 drop(data);
-                return Ok(DebugTargetOrAmbiguity::Target(adhoc_debug_target(reference, compiler).await?));
+                let target = adhoc_debug_target(reference, compiler, config, platform).await?;
+                return Ok(DebugTargetOrAmbiguity::Target(target));
             }
         },
         Some(reference) => match resolve_project_reference(&data, reference) {
@@ -1713,17 +1700,60 @@ pub async fn cmd_debug_target(
             (fallback, Some(note))
         }
     };
-    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
+    let described = with_config_platform(project, config, platform);
+    let mut target = crate::debug_target::build_debug_target(&described, &compiler)?;
     if let Some(note) = orphan_note {
         target.warnings.insert(0, note);
     }
     Ok(DebugTargetOrAmbiguity::Target(target))
 }
 
+/// A copy of `project` with `config`/`platform` in place of its active
+/// configuration and platform, where given. The copy is what gets
+/// described; the managed project is never touched.
+fn with_config_platform(project: &Project, config: Option<String>, platform: Option<String>) -> Project {
+    let mut described = project.clone();
+    if config.is_some() {
+        described.active_configuration = config;
+    }
+    if platform.is_some() {
+        described.active_platform = platform;
+    }
+    described
+}
+
 /// The ad-hoc counterpart of [`cmd_debug_target`] for a project file that
-/// belongs to no workspace: an ephemeral, never-persisted project is
-/// discovered exactly as [`cmd_compile_file`] would build it.
-async fn adhoc_debug_target(file_path: &str, compiler: Option<String>) -> Result<crate::debug_target::DebugTarget> {
+/// belongs to no workspace: the same ephemeral project [`cmd_compile_file`]
+/// builds, described with its compiler.
+async fn adhoc_debug_target(
+    file_path: &str,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Result<crate::debug_target::DebugTarget> {
+    let data = adhoc_project_data(file_path, compiler, config, platform).await?;
+    let project = data.projects.last().expect("adhoc_project_data holds the project");
+    let compiler = data
+        .compiler_for_project(project.id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Ad-hoc project link was not created."))?;
+    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
+    target.project_id = None;
+    Ok(target)
+}
+
+/// The ephemeral, never-persisted project state behind every ad-hoc
+/// command on a project file that belongs to no workspace: one "ad-hoc"
+/// workspace on `compiler` (an exact key or product name; default: the
+/// newest installed) holding the file as its only project — the last entry
+/// of `projects` — with `config`/`platform` overriding the dproj's active
+/// ones where given.
+async fn adhoc_project_data(
+    file_path: &str,
+    compiler: Option<String>,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Result<ProjectsData> {
     if !std::path::Path::new(file_path).exists() {
         bail!("File not found: {file_path}");
     }
@@ -1735,15 +1765,15 @@ async fn adhoc_debug_target(file_path: &str, compiler: Option<String>) -> Result
     data.new_project(&file_path.to_string(), workspace_id, &ide_env)?;
     let project = data
         .projects
-        .last()
+        .last_mut()
         .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
-    let compiler = data
-        .compiler_for_project(project.id)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Ad-hoc project link was not created."))?;
-    let mut target = crate::debug_target::build_debug_target(project, &compiler)?;
-    target.project_id = None;
-    Ok(target)
+    if config.is_some() {
+        project.active_configuration = config;
+    }
+    if platform.is_some() {
+        project.active_platform = platform;
+    }
+    Ok(data)
 }
 
 fn is_delphi_project_path(value: &str) -> bool {
