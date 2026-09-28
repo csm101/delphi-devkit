@@ -1080,7 +1080,7 @@ impl fmt::Display for AmbiguousProjects {
         for m in &self.matches {
             writeln!(f, "- ID {} = {} - {} ({})", m.id, m.location, m.name, m.path)?;
         }
-        write!(f, "Re-run targeting the specific project ID to compile the correct one.")
+        write!(f, "Re-run targeting the specific project ID.")
     }
 }
 
