@@ -171,3 +171,40 @@ fn discover_paths_bare_dpk_has_no_exe() {
     assert!(project.exe.is_none(), "a package has no executable");
     assert!(project.ini.is_none(), "a package has no ini");
 }
+
+/// The sample dproj with its exe output and host application under a
+/// variable: `$(DdkSiteDir)`, spelled unlike the `DDKSITEDIR` that defines it.
+fn discover_with_site_variable(ide_env: &[(String, String)]) -> (tempfile::TempDir, Project) {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = tmp_dir.path();
+    let dproj = sample_dproj_xml()
+        .replace("<DCC_ExeOutput>.</DCC_ExeOutput>", r"<DCC_ExeOutput>$(DdkSiteDir)\bin</DCC_ExeOutput><Debugger_HostApplication>$(DdkSiteDir)\Host.exe</Debugger_HostApplication>");
+    let dproj_path = dir.join("example.debug.test.dproj");
+    fs::write(&dproj_path, dproj).unwrap();
+    fs::write(dir.join("example.debug.test.DPR"), "program example;\nbegin\nend.\n").unwrap();
+    let mut project = Project {
+        id: 1,
+        name: "example.debug.test".to_string(),
+        directory: dir.to_string_lossy().to_string(),
+        dproj: Some(dproj_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    project.discover_paths(ide_env).unwrap();
+    (tmp_dir, project)
+}
+
+#[test]
+fn discover_paths_resolves_a_variable_whatever_its_casing() {
+    let ide_env = vec![("DDKSITEDIR".to_string(), r"C:\site".to_string())];
+    let (_tmp_dir, project) = discover_with_site_variable(&ide_env);
+    assert_eq!(project.exe.as_deref().map(str::to_lowercase).as_deref(), Some(r"c:\site\bin\example.debug.test.exe"));
+    assert_eq!(project.effective_host_application().map(|host| host.to_lowercase()).as_deref(), Some(r"c:\site\host.exe"));
+}
+
+#[test]
+fn discover_paths_never_turns_an_undefined_variable_into_a_root_path() {
+    let (_tmp_dir, project) = discover_with_site_variable(&[]);
+    // Not `\bin\example.debug.test.exe`, not `\Host.exe`: nothing at all.
+    assert_eq!(project.exe, None);
+    assert_eq!(project.effective_host_application(), None);
+}
