@@ -428,6 +428,7 @@ impl Compiler {
     }
 
     async fn do_compile(&self, parameters: &CompilationParameters<'_>) -> Result<()> {
+        let mut outcome = BuildOutcome::default();
         for project in &parameters.projects {
             if compiler_state::is_cancelled() {
                 return Err(anyhow::anyhow!("Compilation cancelled by user."));
@@ -600,6 +601,7 @@ impl Compiler {
                 }
             };
 
+            outcome.record(compiler_state::is_success(), compiler_state::get_code());
             if !parameters.only_one_project {
                 CompilerProgress::notify_single_project_completed(
                     self.client.as_ref(),
@@ -631,7 +633,88 @@ impl Compiler {
             }
             result?;
         }
+        outcome.publish();
         return Ok(());
+    }
+}
+
+/// The outcome of a whole build. `compiler_state` holds the status of the
+/// project compiled last, which is what the per-project notifications need;
+/// a build of several projects, though, succeeded only if every one of them
+/// did, and its exit code is that of the first project that failed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BuildOutcome {
+    first_failure: Option<i32>,
+}
+
+impl BuildOutcome {
+    fn record(&mut self, success: bool, code: i32) {
+        if !success && self.first_failure.is_none() {
+            self.first_failure = Some(code);
+        }
+    }
+
+    /// Makes the build's outcome the state callers read once it is over.
+    fn publish(&self) {
+        if let Some(code) = self.first_failure {
+            compiler_state::set_success(false);
+            compiler_state::set_code(code);
+        }
+    }
+}
+
+/// The compiler configuration's build arguments as MSBuild receives them.
+/// Each entry is one argument and is passed as it is, spaces included
+/// (`/p:DCC_Define=FOO BAR`, a log file under `C:\build logs`). An entry
+/// holding several switches in one string (`/v:q /nologo`) is still split,
+/// as it always was: it is recognised by every one of its words being a
+/// switch.
+fn split_build_arguments(build_arguments: &[String]) -> Vec<String> {
+    let is_switch = |word: &str| word.starts_with('/') || word.starts_with('-');
+    build_arguments
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .flat_map(|entry| {
+            if entry.split_whitespace().all(is_switch) {
+                entry.split_whitespace().map(str::to_string).collect::<Vec<_>>()
+            } else {
+                vec![entry.to_string()]
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::{BuildOutcome, split_build_arguments};
+
+    fn split(entries: &[&str]) -> Vec<String> {
+        split_build_arguments(&entries.iter().map(|entry| entry.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn an_argument_containing_spaces_stays_one_argument() {
+        assert_eq!(
+            split(&["/p:DCC_Define=FOO BAR", r"/flp:logfile=C:\build logs\ddk.log"]),
+            vec!["/p:DCC_Define=FOO BAR", r"/flp:logfile=C:\build logs\ddk.log"]
+        );
+    }
+
+    #[test]
+    fn an_entry_made_of_switches_only_is_still_split() {
+        assert_eq!(split(&["/verbosity:minimal /nologo", "  ", "-m"]), vec!["/verbosity:minimal", "/nologo", "-m"]);
+    }
+
+    #[test]
+    fn a_build_fails_when_any_project_failed_and_reports_the_first_failure() {
+        let mut outcome = BuildOutcome::default();
+        outcome.record(true, 0);
+        assert_eq!(outcome.first_failure, None);
+        outcome.record(false, 3);
+        outcome.record(true, 0);
+        outcome.record(false, 9);
+        assert_eq!(outcome.first_failure, Some(3));
     }
 }
 
@@ -790,7 +873,7 @@ fn msbuild_arguments(
 ) -> Vec<String> {
     let target = if rebuild { "Build" } else { "Make" };
     let mut args = vec![project_file.to_string(), format!("/t:Clean,{target}")];
-    args.extend(build_arguments.join(" ").split_whitespace().map(str::to_string));
+    args.extend(split_build_arguments(build_arguments));
     args.push(format!("/p:Config={config}"));
     args.push(format!("/p:Configuration={config}"));
     args.push(format!("/p:Platform={platform}"));

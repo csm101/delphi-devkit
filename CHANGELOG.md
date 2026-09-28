@@ -24,6 +24,14 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
   `ddk run` (CLI/MCP) is unchanged and still launches detached.
 
+### Fixed
+
+- **Build arguments containing spaces**: a compiler configuration's build argument such as `/p:DCC_Define=FOO BAR`, or a log file path with a space, reached MSBuild torn apart at the space. Each entry is now passed as one argument; an entry holding several switches in one string (`/v:q /nologo`) is still split.
+- **Outcome of a build of several projects**: compiling a workspace or the group project reported the status of the project compiled *last*, so a failure followed by a success counted as a success. The build now succeeds only if every project did, with the exit code of the first one that failed.
+- **MCP arguments of the wrong type were ignored**: `"project_id": "7"` made a tool act on the active project, `"rebuild": "true"` compiled incrementally — silently. Numbers and flags are now understood in their obvious spellings (a numeric string, `"true"`, `1`), and anything else is rejected with a message naming the argument. `delphi_generate_delphilsp_config` accepts `project_id` too.
+- **Commands that need a selected project or an open group project** (`Compile/Recreate/Run Selected Project`, `Unload Group Project`, `Swap .DFM/.PAS`) are disabled while they cannot work, instead of only being declared so: their condition sat in a `when` property, which commands do not have.
+- The "matches multiple projects" message no longer says "to compile" when the command was a run or a settings generation.
+
 ## [2.6.0] - 2026-08-03
 
 ### Added

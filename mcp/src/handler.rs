@@ -15,6 +15,8 @@ use std::sync::Arc;
 use ddk_core::commands;
 use ddk_core::commands::CompileFilterOptions;
 
+use crate::arguments::{ArgumentResult, Arguments};
+
 // ---------------------------------------------------------------------------
 // README content embedded at compile time
 // ---------------------------------------------------------------------------
@@ -398,10 +400,22 @@ async fn list_projects() -> String {
     }
 }
 
+/// Runs a tool whose arguments may be malformed: the message naming the
+/// wrong argument is the tool's answer, exactly like any other failure.
+/// The output filter both compile tools take.
+fn compile_filter(arguments: &Arguments) -> ArgumentResult<CompileFilterOptions> {
+    Ok(CompileFilterOptions {
+        trim_banners: true,
+        show_warnings: arguments.flag("show_warnings")?,
+        show_hints: arguments.flag("show_hints")?,
+        summarize_diagnostics: arguments.flag("summarize_diagnostics")?,
+    })
+}
+
 async fn select_project(args: &Value) -> String {
-    let project_id = match args.get("project_id").and_then(|v| v.as_u64()) {
-        Some(id) => id as usize,
-        _ => return "Missing required parameter: project_id".to_string(),
+    let project_id = match Arguments::new(args).required_number("project_id") {
+        Ok(id) => id as usize,
+        Err(message) => return message,
     };
     match commands::cmd_select_project(project_id).await {
         Ok(result) => result.to_string(),
@@ -422,9 +436,9 @@ async fn get_available_compilers() -> String {
 }
 
 async fn set_group_projects_compiler(args: &Value) -> String {
-    let compiler_key = match args.get("compiler").and_then(|v| v.as_str()) {
-        Some(k) => k.to_string(),
-        _ => return "Missing required parameter: compiler".to_string(),
+    let compiler_key = match Arguments::new(args).required_text("compiler") {
+        Ok(key) => key,
+        Err(message) => return message,
     };
     match commands::cmd_set_group_compiler(compiler_key).await {
         Ok(result) => result.to_string(),
@@ -433,27 +447,14 @@ async fn set_group_projects_compiler(args: &Value) -> String {
 }
 
 async fn compile_project(args: &Value) -> String {
-    let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
-    let debug_info = args.get("debug_info").and_then(|v| v.as_bool()).unwrap_or(false);
-    let filter = CompileFilterOptions {
-        trim_banners: true,
-        show_warnings: args.get("show_warnings").and_then(|v| v.as_bool()).unwrap_or(false),
-        show_hints: args.get("show_hints").and_then(|v| v.as_bool()).unwrap_or(false),
-        summarize_diagnostics: args
-            .get("summarize_diagnostics")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> {
+        Ok((arguments.flag("rebuild")?, arguments.flag("debug_info")?, compile_filter(&arguments)?, arguments.project_reference()?))
+    })();
+    let (rebuild, debug_info, filter, reference) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
     };
-    // `project` (name or id) takes precedence; fall back to a numeric `project_id`.
-    let reference = args
-        .get("project")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            args.get("project_id")
-                .and_then(|v| v.as_u64())
-                .map(|id| id.to_string())
-        });
     match commands::cmd_compile_ref(rebuild, debug_info, reference, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => {
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
@@ -464,23 +465,21 @@ async fn compile_project(args: &Value) -> String {
 }
 
 async fn compile_file(args: &Value) -> String {
-    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        _ => return "Missing required parameter: file_path".to_string(),
-    };
-    let compiler = args.get("compiler").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let config = args.get("config").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let platform = args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
-    let debug_info = args.get("debug_info").and_then(|v| v.as_bool()).unwrap_or(false);
-    let filter = CompileFilterOptions {
-        trim_banners: true,
-        show_warnings: args.get("show_warnings").and_then(|v| v.as_bool()).unwrap_or(false),
-        show_hints: args.get("show_hints").and_then(|v| v.as_bool()).unwrap_or(false),
-        summarize_diagnostics: args
-            .get("summarize_diagnostics")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> {
+        Ok((
+            arguments.required_text("file_path")?,
+            arguments.text("compiler")?,
+            arguments.text("config")?,
+            arguments.text("platform")?,
+            arguments.flag("rebuild")?,
+            arguments.flag("debug_info")?,
+            compile_filter(&arguments)?,
+        ))
+    })();
+    let (file_path, compiler, config, platform, rebuild, debug_info, filter) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
     };
     match commands::cmd_compile_file(file_path, compiler, config, platform, rebuild, debug_info, filter, Vec::new()).await {
         Ok(commands::CompileOrAmbiguity::Output(output)) => {
@@ -492,17 +491,12 @@ async fn compile_file(args: &Value) -> String {
 }
 
 async fn run_project(args: &Value) -> String {
-    // `project` (name or id) takes precedence; fall back to a numeric `project_id`.
-    let reference = args
-        .get("project")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            args.get("project_id")
-                .and_then(|v| v.as_u64())
-                .map(|id| id.to_string())
-        });
-    let run_args = args.get("args").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.project_reference()?, arguments.text("args")?)) })();
+    let (reference, run_args) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
+    };
     match commands::cmd_run_ref(reference, run_args).await {
         Ok(commands::RunOrAmbiguity::Output(output)) => output.to_string(),
         Ok(commands::RunOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
@@ -511,11 +505,12 @@ async fn run_project(args: &Value) -> String {
 }
 
 async fn run_file(args: &Value) -> String {
-    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        _ => return "Missing required parameter: file_path".to_string(),
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.required_text("file_path")?, arguments.text("args")?)) })();
+    let (file_path, run_args) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
     };
-    let run_args = args.get("args").and_then(|v| v.as_str()).map(|s| s.to_string());
     match commands::cmd_run_path(file_path, run_args).await {
         Ok(commands::RunOrAmbiguity::Output(output)) => output.to_string(),
         Ok(commands::RunOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
@@ -524,13 +519,11 @@ async fn run_file(args: &Value) -> String {
 }
 
 async fn add_project(args: &Value) -> String {
-    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        _ => return "Missing required parameter: file_path".to_string(),
-    };
-    let workspace = match args.get("workspace").and_then(|v| v.as_str()) {
-        Some(w) => w.to_string(),
-        _ => return "Missing required parameter: workspace".to_string(),
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.required_text("file_path")?, arguments.required_text("workspace")?)) })();
+    let (file_path, workspace) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
     };
     match commands::cmd_add_project(file_path, workspace).await {
         Ok(result) => result.to_string(),
@@ -539,13 +532,11 @@ async fn add_project(args: &Value) -> String {
 }
 
 async fn add_workspace(args: &Value) -> String {
-    let name = match args.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        _ => return "Missing required parameter: name".to_string(),
-    };
-    let compiler = match args.get("compiler").and_then(|v| v.as_str()) {
-        Some(c) => c.to_string(),
-        _ => return "Missing required parameter: compiler".to_string(),
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.required_text("name")?, arguments.required_text("compiler")?)) })();
+    let (name, compiler) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
     };
     match commands::cmd_add_workspace(name, compiler).await {
         Ok(result) => result.to_string(),
@@ -554,14 +545,13 @@ async fn add_workspace(args: &Value) -> String {
 }
 
 async fn generate_delphilsp_config(args: &Value) -> String {
-    let string_arg = |key: &str| args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
-    match commands::cmd_delphilsp_config(
-        string_arg("project"),
-        string_arg("compiler"),
-        string_arg("out"),
-    )
-    .await
-    {
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.project_reference()?, arguments.text("compiler")?, arguments.text("out")?)) })();
+    let (project, compiler, out) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
+    };
+    match commands::cmd_delphilsp_config(project, compiler, out).await {
         Ok(commands::DelphiLspOrAmbiguity::Output(result)) => result.to_string(),
         Ok(commands::DelphiLspOrAmbiguity::Ambiguity(amb)) => amb.to_string(),
         Err(e) => format!("{e}"),
@@ -569,13 +559,12 @@ async fn generate_delphilsp_config(args: &Value) -> String {
 }
 
 async fn format_file(args: &Value) -> String {
-    let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        _ => return "Missing required parameter: file_path".to_string(),
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> { Ok((arguments.required_text("file_path")?, arguments.text("encoding")?)) })();
+    let (file_path, encoding) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
     };
-    let encoding = args
-        .get("encoding")
-        .and_then(|v| v.as_str().map(|s| s.to_string()));
     match commands::cmd_format_file(file_path, encoding).await {
         Ok(path) => format!("{path}"),
         Err(e) => format!("{e}"),
@@ -583,16 +572,14 @@ async fn format_file(args: &Value) -> String {
 }
 
 async fn get_debug_target(args: &Value) -> String {
-    // `project` (name, id or path) takes precedence; fall back to a numeric
-    // `project_id`, and accept a bare number under `project` as an id too.
-    let project = args
-        .get("project")
-        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|id| id.to_string())))
-        .or_else(|| args.get("project_id").and_then(|v| v.as_u64()).map(|id| id.to_string()));
-    let optional_string = |name: &str| args.get(name).and_then(|v| v.as_str()).map(|s| s.to_string());
-    let compiler = optional_string("compiler");
-    let config = optional_string("config");
-    let platform = optional_string("platform");
+    let arguments = Arguments::new(args);
+    let parsed = (|| -> ArgumentResult<_> {
+        Ok((arguments.project_reference()?, arguments.text("compiler")?, arguments.text("config")?, arguments.text("platform")?))
+    })();
+    let (project, compiler, config, platform) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => return message,
+    };
     match commands::cmd_debug_target(project, compiler, config, platform).await {
         Ok(commands::DebugTargetOrAmbiguity::Target(target)) => {
             serde_json::to_string_pretty(&target).unwrap_or_else(|_| target.to_string())
