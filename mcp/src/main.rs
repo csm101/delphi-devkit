@@ -10,6 +10,7 @@
 //! selected project or compiler are picked up by ddk-server's file watcher,
 //! which pushes the updated state to VS Code automatically.
 
+mod arguments;
 mod handler;
 
 use handler::DdkMcpHandler;
