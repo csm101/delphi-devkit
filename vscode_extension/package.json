@@ -203,7 +203,7 @@
         "command": "ddk.projects.unloadGroupProject",
         "title": "Unload Group Project",
         "icon": "$(close)",
-        "when": "ddk:isGroupProjectOpened == true",
+        "enablement": "ddk:isGroupProjectOpened == true",
         "category": "DDK"
       },
       {
@@ -215,25 +215,25 @@
       {
         "command": "ddk.projects.compileSelectedProject",
         "title": "Compile Selected Project",
-        "when": "ddk:isProjectSelected == true",
+        "enablement": "ddk:isProjectSelected == true",
         "category": "DDK"
       },
       {
         "command": "ddk.projects.recreateSelectedProject",
         "title": "Recreate Selected Project",
-        "when": "ddk:isProjectSelected == true",
+        "enablement": "ddk:isProjectSelected == true",
         "category": "DDK"
       },
       {
         "command": "ddk.projects.runSelectedProject",
         "title": "Run Selected Project",
-        "when": "ddk:isProjectSelected == true && ddk:doesSelectedProjectHaveExe == true",
+        "enablement": "ddk:isProjectSelected == true && ddk:doesSelectedProjectHaveExe == true",
         "category": "DDK"
       },
       {
         "command": "ddk.dfm.swapToDfmPas",
         "title": "Swap .DFM/.PAS",
-        "when": "editorTextFocus && resourceExtname =~ /^\\.(pas|dfm)$/i",
+        "enablement": "resourceExtname =~ /^\\.(pas|dfm)$/i",
         "category": "DDK"
       },
       {
