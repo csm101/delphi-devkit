@@ -13,19 +13,33 @@
 //! `delphi_get_debug_target` tool, the LSP `debug/target` method — are thin
 //! wrappers around [`crate::commands::cmd_debug_target`].
 //!
+//! Two rules hold throughout:
+//!
+//! * **A path in the target is a file that was found.** Symbol files, module
+//!   binaries and `.dcp`s are `None` when they are not on disk; what is
+//!   missing is said in `warnings`, never implied by a path that leads
+//!   nowhere.
+//! * **`warnings` are problems, `notes` are information.** A warning means
+//!   the session will be degraded or will not work; a note explains a choice
+//!   DevKit made. An empty `warnings` list therefore means ready to debug.
+//!
 //! Everything read from outside the project state — `rsvars.bat`, the IDE's
 //! registry settings — comes in through [`IdeSettings`], so the builder is a
-//! pure function of its inputs and tests need neither a Delphi installation
-//! nor `HKCU`.
+//! pure function of its inputs and its tests need neither a Delphi
+//! installation nor `HKCU`.
+
+mod lib_suffix;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::delphilsp::{IdeLibrarySettings, IdeRegistryRoot};
+use crate::files::dproj::{has_unresolved_macro, load_with_environment, unresolved_macros};
 use crate::projects::{CompilerConfiguration, IdeEnvironment, MacroMap, Project};
 use crate::utils::normalize_path;
+use lib_suffix::{BuildSymbols, DeclaredSuffix};
 
 /// What kind of binary the project produces, which decides how it is
 /// debugged: a program is launched itself, a package or a DLL is loaded by
@@ -38,23 +52,24 @@ pub enum DebugTargetKind {
     Library,
 }
 
-/// The symbol files a debugger reads next to the launched executable.
+/// The symbol files found next to a binary; `None` for one that is not there.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolFiles {
     /// The linker map (`DCC_MapFile=3`): source lines and public names.
-    pub map: String,
+    pub map: Option<String>,
     /// The remote-debug symbols (`DCC_RemoteDebug`): locals, types, expressions.
-    pub rsm: String,
+    pub rsm: Option<String>,
 }
 
 /// A module the target process loads at run time whose debug information the
 /// debugger should bind up front: the project's own package or DLL, or the
-/// project's own program when a Host Application launches it.
+/// project's own program when a Host Application launches it. Every path is
+/// a file that exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugModule {
-    /// The module's file name (`libAbout290.bpl`), how a loaded module is matched.
+    /// The module's file name (`libAbout290.bpl`), how a loaded module is
+    /// matched; known even when the module was never built.
     pub name: String,
-    /// The built module on disk, when found.
     pub binary: Option<String>,
     pub map: Option<String>,
     pub rsm: Option<String>,
@@ -74,7 +89,8 @@ pub struct DebugTarget {
     pub kind: DebugTargetKind,
     /// The process to launch or attach to: the program's own exe, or the
     /// Host Application that loads a package, a DLL — or the program itself,
-    /// when one is configured for it.
+    /// when one is configured for it. The one path that may not exist yet
+    /// (a program never built); `warnings` says so.
     pub executable: String,
     /// The Host Application when the executable is one.
     pub host_application: Option<String>,
@@ -84,7 +100,7 @@ pub struct DebugTarget {
     pub platform: String,
     /// `32` or `64` for a Windows platform; `None` (with a warning) otherwise.
     pub bitness: Option<u8>,
-    /// Symbol files expected next to `executable`.
+    /// The symbol files found next to `executable`.
     pub symbols: SymbolFiles,
     /// The project directory.
     pub source_root: String,
@@ -99,12 +115,15 @@ pub struct DebugTarget {
     /// Command-line arguments: the dproj's `Debugger_RunParams` fused with the
     /// saved Start Parameters, exactly as `Run` passes them.
     pub args: Vec<String>,
-    /// Human-readable problems that will degrade or break a session:
-    /// missing executable or module, missing or stale symbols, a non-Windows
-    /// platform, and every input that could not be read (an unparsable dproj,
-    /// a missing `rsvars.bat`), since the target is then described from
-    /// less than the IDE would use.
+    /// What will degrade or break a session: a missing executable or module,
+    /// missing, empty or stale symbols, a platform the project does not
+    /// build or Windows cannot debug, a value depending on an undefined
+    /// `$(NAME)`, an input that could not be read. Empty means ready.
     pub warnings: Vec<String>,
+    /// What DevKit decided or left out without harm to the session: the
+    /// compiler an unlinked project is described with, an IDE path that is
+    /// not configured, search path entries that do not exist.
+    pub notes: Vec<String>,
 }
 
 impl std::fmt::Display for DebugTarget {
@@ -114,13 +133,14 @@ impl std::fmt::Display for DebugTarget {
             DebugTargetKind::Package => "package",
             DebugTargetKind::Library => "library",
         };
+        let found = |file: &Option<String>| file.clone().unwrap_or_else(|| "(none)".to_string());
         writeln!(f, "Debug target for \"{}\" ({kind}, {} {}, {}):", self.project, self.config, self.platform, self.compiler)?;
         writeln!(f, "  project file: {}", self.project_file)?;
         writeln!(f, "  executable:   {}", self.executable)?;
         if let Some(host) = &self.host_application {
             writeln!(f, "  host app:     {host}")?;
         }
-        writeln!(f, "  map / rsm:    {} / {}", self.symbols.map, self.symbols.rsm)?;
+        writeln!(f, "  map / rsm:    {} / {}", found(&self.symbols.map), found(&self.symbols.rsm))?;
         for module in &self.modules {
             writeln!(f, "  module:       {} -> {}", module.name, module.binary.as_deref().unwrap_or("(not built)"))?;
         }
@@ -129,14 +149,89 @@ impl std::fmt::Display for DebugTarget {
         }
         writeln!(f, "  source root:  {}", self.source_root)?;
         writeln!(f, "  source paths: {} directories", self.source_search_paths.len())?;
-        if !self.warnings.is_empty() {
-            writeln!(f, "Warnings:")?;
-            for warning in &self.warnings {
-                writeln!(f, "- {warning}")?;
+        for (title, lines) in [("Warnings", &self.warnings), ("Notes", &self.notes)] {
+            if lines.is_empty() {
+                continue;
+            }
+            writeln!(f, "{title}:")?;
+            for line in lines {
+                writeln!(f, "- {line}")?;
             }
         }
         Ok(())
     }
+}
+
+/// What is wrong with the target, and what is merely worth knowing.
+#[derive(Debug, Default)]
+struct Report {
+    warnings: Vec<String>,
+    notes: Vec<String>,
+}
+
+impl Report {
+    fn warn(&mut self, message: impl Into<String>) {
+        push_once(&mut self.warnings, message.into());
+    }
+
+    fn note(&mut self, message: impl Into<String>) {
+        push_once(&mut self.notes, message.into());
+    }
+
+    /// A value that cannot be used because a `$(NAME)` in it has no definition.
+    fn warn_unresolved(&mut self, what: &str, value: &str) {
+        let names: Vec<String> = unresolved_macros(value).iter().map(|name| format!("$({name})")).collect();
+        self.warn(format!(
+            "{what} depends on {}, which nothing defines (not rsvars.bat, not the IDE's environment variables, \
+             not the project): \"{value}\" was ignored.",
+            names.join(", ")
+        ));
+    }
+}
+
+fn push_once(lines: &mut Vec<String>, line: String) {
+    if !lines.contains(&line) {
+        lines.push(line);
+    }
+}
+
+// ─── The project to describe ─────────────────────────────────────────────────
+
+/// The project as it has to be described: `project` itself, or — when
+/// `config`/`platform` ask for another build than the active one — a copy
+/// whose executable, Host Application and run parameters were discovered
+/// anew **for that build**. The persisted ones belong to the active
+/// configuration and platform; describing a Release/Win64 build with the
+/// Debug/Win32 executable would hand a debugger the wrong binary. When the
+/// discovery fails, those values are dropped rather than kept, and the
+/// reason comes back as a warning.
+pub fn project_to_describe(
+    project: &Project,
+    config: Option<String>,
+    platform: Option<String>,
+    ide_env: &[(String, String)],
+) -> (Project, Vec<String>) {
+    let mut described = project.clone();
+    if config.is_none() && platform.is_none() {
+        return (described, Vec::new());
+    }
+    if config.is_some() {
+        described.active_configuration = config;
+    }
+    if platform.is_some() {
+        described.active_platform = platform;
+    }
+    let mut warnings = Vec::new();
+    if let Err(error) = described.discover_paths(ide_env) {
+        described.exe = None;
+        described.dproj_run_params = None;
+        described.dproj_host_application = None;
+        warnings.push(format!(
+            "The project's paths could not be discovered for the requested build ({error}); \
+             the executable and the Host Application of the active build were not used in their place."
+        ));
+    }
+    (described, warnings)
 }
 
 // ─── IDE inputs ──────────────────────────────────────────────────────────────
@@ -178,6 +273,8 @@ fn bds_version(compiler: &CompilerConfiguration) -> String {
 
 /// Describes the debug target of a project that builds with `compiler`,
 /// reading the installation's `rsvars.bat` and the IDE's registry settings.
+/// The project's active configuration and platform are the ones described;
+/// see [`project_to_describe`] for another build.
 pub fn build_debug_target(project: &Project, compiler: &CompilerConfiguration) -> Result<DebugTarget> {
     build_debug_target_with(project, compiler, &InstalledIde { compiler })
 }
@@ -189,64 +286,56 @@ pub fn build_debug_target_with(
     compiler: &CompilerConfiguration,
     ide: &dyn IdeSettings,
 ) -> Result<DebugTarget> {
-    let mut warnings = Vec::new();
-    let context = TargetContext::new(project, compiler, ide, &mut warnings);
+    let mut report = Report::default();
+    let context = TargetContext::new(project, compiler, ide, &mut report);
 
     let kind = context.kind();
-    // DevKit's own override wins; then the dproj read live for the described
-    // config/platform (the persisted discovery was made for the *active*
-    // ones, and a `--platform` override may select a different host, or
-    // none). The persisted value is the fallback only when the dproj could
-    // not be evaluated: a dproj that was read and names no host for this
-    // platform means there is none.
-    let usable = |value: &String| !value.trim().is_empty() && !value.contains("$(");
-    let host_application = project
-        .host_application
-        .clone()
-        .filter(usable)
-        .or_else(|| context.dproj_host_application())
-        .or_else(|| {
-            if context.group.is_some() {
-                return None;
-            }
-            project.dproj_host_application.clone().filter(usable)
-        });
+    let host_application = context.host_application(&mut report);
     let executable = match (kind, &host_application, &project.exe) {
         (_, Some(host), _) => host.clone(),
         (DebugTargetKind::Program, None, Some(exe)) => exe.clone(),
         (DebugTargetKind::Program, None, None) => bail!(
-            "Project \"{}\" has no executable to debug. Compile it first.",
-            project.name
+            "Project \"{}\" has no executable to debug for {} {}. Compile it first.",
+            project.name,
+            context.config,
+            context.platform
         ),
         (_, None, _) => bail!(
-            "{} \"{}\" has no Host Application to debug through. Set one via Project > Options > Debugger \
-             in the Delphi IDE, or DevKit's \"Set Host Application\".",
+            "{} \"{}\" has no Host Application to debug through for {} {}. Set one via Project > Options > \
+             Debugger in the Delphi IDE, or DevKit's \"Set Host Application\".",
             if kind == DebugTargetKind::Package { "Package" } else { "Library" },
-            project.name
+            project.name,
+            context.config,
+            context.platform
         ),
     };
-    // The launched executable's own symbols matter only when it is the
-    // project's program; a host's symbols are optional, the module's count.
+    // The launched executable's own symbols are required only when it is
+    // the project's program; a host's are a bonus, the module's count.
     let launches_own_program = kind == DebugTargetKind::Program && host_application.is_none();
-    check_executable_artefacts(&executable, launches_own_program, &mut warnings);
+    let symbols = if Path::new(&executable).exists() {
+        symbols_next_to(&executable, "the executable", launches_own_program, &mut report)
+    } else {
+        report.warn(format!("Executable not found: {executable}. Compile the project first."));
+        SymbolFiles::default()
+    };
 
     let bitness = match context.platform.to_lowercase().as_str() {
         "win32" => Some(32),
         "win64" | "win64x" => Some(64),
         other => {
-            warnings.push(format!("Platform {other} is not a Windows target; a Windows debugger cannot debug it."));
+            report.warn(format!("Platform {other} is not a Windows target; a Windows debugger cannot debug it."));
             None
         }
     };
 
-    let modules = match kind {
+    let modules: Vec<DebugModule> = match kind {
         DebugTargetKind::Program if launches_own_program => Vec::new(),
-        DebugTargetKind::Program => context.hosted_program_module(&mut warnings).into_iter().collect(),
-        DebugTargetKind::Package => context.package_module(&executable, &mut warnings).into_iter().collect(),
-        DebugTargetKind::Library => context.library_module(&mut warnings).into_iter().collect(),
+        DebugTargetKind::Program => vec![context.hosted_program_module(&mut report)],
+        DebugTargetKind::Package => vec![context.package_module(&executable, &mut report)],
+        DebugTargetKind::Library => vec![context.library_module(&mut report)],
     };
 
-    let source_search_paths = context.source_search_paths();
+    let source_search_paths = context.source_search_paths(&mut report);
 
     let args = crate::commands::fuse_run_params(project.dproj_run_params.clone(), project.start_parameters.clone())
         .map(|joined| crate::commands::split_run_args(&joined))
@@ -265,10 +354,7 @@ pub fn build_debug_target_with(
         project_file: json_path(&project_file),
         main_source: main_source.as_deref().map(json_path),
         kind,
-        symbols: SymbolFiles {
-            map: json_path(&sibling(&executable, "map")),
-            rsm: json_path(&sibling(&executable, "rsm")),
-        },
+        symbols,
         executable: json_path(&executable),
         host_application: host_application.as_deref().map(json_path),
         compiler: compiler.product_name.clone(),
@@ -279,15 +365,16 @@ pub fn build_debug_target_with(
         source_search_paths,
         modules,
         args,
-        warnings,
+        warnings: report.warnings,
+        notes: report.notes,
     })
 }
 
 /// Everything the builder needs, resolved once: the effective configuration
 /// and platform, the dproj evaluated for them, the macro map that expands
 /// `$(NAME)` the way the IDE would, and the IDE's library settings. Every
-/// input that fails to load is reported in `warnings` and replaced by the
-/// best available fallback, never silently.
+/// input that fails to load is reported and replaced by the best available
+/// fallback, never silently.
 struct TargetContext<'a> {
     project: &'a Project,
     compiler: &'a CompilerConfiguration,
@@ -299,15 +386,25 @@ struct TargetContext<'a> {
     library: IdeLibrarySettings,
 }
 
+/// A directory value once its macros are expanded.
+enum Directory {
+    /// Nothing was configured.
+    Blank,
+    Found(PathBuf),
+    /// A `$(NAME)` in it has no definition; the expanded text is kept for
+    /// the report.
+    Unresolved(String),
+}
+
 impl<'a> TargetContext<'a> {
     fn new(
         project: &'a Project,
         compiler: &'a CompilerConfiguration,
         ide: &dyn IdeSettings,
-        warnings: &mut Vec<String>,
+        report: &mut Report,
     ) -> Self {
         let environment = ide.environment().unwrap_or_else(|error| {
-            warnings.push(format!(
+            report.warn(format!(
                 "The IDE environment of {} could not be read ({error}); $(BDS)-relative paths will stay unresolved.",
                 compiler.product_name
             ));
@@ -315,17 +412,15 @@ impl<'a> TargetContext<'a> {
         });
         let mut macros = environment.macros(Path::new(&compiler.installation_path));
         macros.set("ProjectDir", project.directory.clone());
-        macros.set("ProjectName", project.name.clone());
+        macros.set("ProjectName", project_file_stem(project));
         // `<DllSuffix>$(Auto)</DllSuffix>`: the IDE's automatic LIBSUFFIX is
         // the package version (`290` for Delphi 12).
         macros.set("Auto", compiler.package_version.to_string());
 
         let dproj = project.dproj.as_deref().and_then(|path| {
-            dproj_rs::DprojBuilder::new()
-                .env(macros.as_env())
-                .from_file(path)
+            load_with_environment(&PathBuf::from(path), macros.as_env())
                 .map_err(|error| {
-                    warnings.push(format!(
+                    report.warn(format!(
                         "Could not evaluate {path} ({error}); the target is described from DevKit's recorded \
                          project state alone, so config/platform, host application and search paths may be incomplete."
                     ));
@@ -333,11 +428,14 @@ impl<'a> TargetContext<'a> {
                 .ok()
         });
         let (config, platform) = effective_config_platform(project, dproj.as_ref());
+        if let Some(dproj) = &dproj {
+            warn_about_an_unsupported_platform(dproj, &platform, report);
+        }
         let group = dproj.as_ref().and_then(|dproj| {
             dproj
                 .active_property_group_for(&config, &platform)
                 .map_err(|error| {
-                    warnings.push(format!(
+                    report.warn(format!(
                         "The dproj defines no property group for {config}/{platform} ({error}); output directories, \
                          host application and search paths from the dproj are unavailable."
                     ));
@@ -349,159 +447,218 @@ impl<'a> TargetContext<'a> {
         macros.set("Platform", platform.clone());
 
         let library = ide.library_settings(&platform);
-        if library.search_path.is_none() && library.browsing_path.is_none() {
-            warnings.push(format!(
-                "No IDE Library Path found for {platform} under {}; only the project's own paths and the \
-                 compiler's source tree are searched for sources.",
-                IdeRegistryRoot::for_bds_version(compiler.product_version).key_path()
+        let registry_key = IdeRegistryRoot::for_bds_version(compiler.product_version).key_path();
+        if library.search_path.is_none() {
+            report.note(format!(
+                "No IDE Library Path is configured for {platform} ({registry_key}); sources are looked for in the \
+                 project's own paths, the Browsing Path and the compiler's source tree."
+            ));
+        }
+        if library.browsing_path.is_none() {
+            report.note(format!(
+                "No IDE Browsing Path is configured for {platform} ({registry_key}); the sources of third-party \
+                 libraries will not be found through it."
             ));
         }
 
         TargetContext { project, compiler, config, platform, group, macros, library }
     }
 
+    /// A package by its main source or its `AppType`; a library by `AppType`
+    /// or `GenDll`. Both properties sit in the dproj's unconditional group,
+    /// so the kind does not depend on the platform being one the project
+    /// defines settings for.
     fn kind(&self) -> DebugTargetKind {
-        if self.project.dpk.is_some() {
+        let properties = self.group.as_ref().map(|group| &group.project_properties);
+        let app_type = properties.and_then(|properties| properties.app_type.as_deref()).unwrap_or("");
+        if self.project.dpk.is_some() || app_type.eq_ignore_ascii_case("Package") {
             return DebugTargetKind::Package;
         }
-        let generates_dll = self
-            .group
-            .as_ref()
-            .and_then(|group| group.project_properties.gen_dll.as_deref())
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if generates_dll {
+        let generates_dll = properties
+            .and_then(|properties| properties.gen_dll.as_deref())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        if app_type.eq_ignore_ascii_case("Library") || generates_dll {
             return DebugTargetKind::Library;
         }
         DebugTargetKind::Program
     }
 
-    /// The dproj's own `Debugger_HostApplication` for the effective
-    /// configuration/platform, read live and macro-expanded: the fallback
-    /// when the persisted project state predates host discovery or is stale.
-    fn dproj_host_application(&self) -> Option<String> {
-        let raw = self.group.as_ref()?.other.get("Debugger_HostApplication")?;
-        let host = self.macros.expand(raw.trim());
-        if host.is_empty() || host.contains("$(") {
+    /// The Host Application, by the rule `Run` follows — DevKit's override,
+    /// then the dproj's value DevKit recorded — and, where the record has
+    /// none (it may predate host discovery), the dproj read now. A relative
+    /// path is resolved against the project directory. A host depending on
+    /// an undefined `$(NAME)` is no host, and is reported.
+    fn host_application(&self, report: &mut Report) -> Option<String> {
+        let recorded = [
+            ("DevKit's Host Application override", &self.project.host_application),
+            ("The dproj's Host Application", &self.project.dproj_host_application),
+        ];
+        for (what, host) in recorded {
+            let Some(host) = host.as_deref().map(str::trim).filter(|host| !host.is_empty()) else {
+                continue;
+            };
+            if has_unresolved_macro(host) {
+                report.warn_unresolved(what, host);
+                continue;
+            }
+            return Some(absolutize(host, &self.project.directory).to_string_lossy().to_string());
+        }
+        let live = self.group.as_ref()?.other.get("Debugger_HostApplication")?.trim();
+        if live.is_empty() {
             return None;
         }
-        Some(absolutize(&host, &self.project.directory).to_string_lossy().to_string())
+        if has_unresolved_macro(live) {
+            report.warn_unresolved("The dproj's Host Application", live);
+            return None;
+        }
+        Some(absolutize(live, &self.project.directory).to_string_lossy().to_string())
     }
 
-    /// The file name stem of the built package/DLL: the project name plus
-    /// its `LIBSUFFIX`.
-    fn binary_stem(&self) -> String {
-        format!("{}{}", self.project.name, self.lib_suffix())
+    /// The file name stem of what the project builds: that of its main
+    /// source, as the compiler names the output — not the project's display
+    /// name, which can be anything.
+    fn output_stem(&self) -> String {
+        self.project
+            .dpk
+            .as_deref()
+            .or(self.project.dpr.as_deref())
+            .and_then(|main_source| Path::new(main_source).file_stem())
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.project.name.clone())
     }
 
-    /// The `LIBSUFFIX` of the package/DLL: the dproj's `DllSuffix` (already
-    /// macro-expanded, `$(Auto)` included), else the `{$LIBSUFFIX}` directive
-    /// of the main source — the only place a hand-maintained package
-    /// declares it — where `AUTO` means the compiler's package version.
-    fn lib_suffix(&self) -> String {
-        let declared = self
+    /// The stem of the built package/DLL: the output stem plus its `LIBSUFFIX`.
+    fn binary_stem(&self, report: &mut Report) -> String {
+        format!("{}{}", self.output_stem(), self.lib_suffix(report))
+    }
+
+    /// The `LIBSUFFIX` of the package/DLL: the dproj's `DllSuffix` (macros
+    /// expanded, `$(Auto)` included), else what the main source declares
+    /// with `{$LIBSUFFIX}` for this compiler and platform.
+    fn lib_suffix(&self, report: &mut Report) -> String {
+        let from_dproj = self
             .group
             .as_ref()
             .and_then(|group| group.other.get("DllSuffix"))
-            .map(|suffix| suffix.trim().to_string())
-            .filter(|suffix| !suffix.is_empty())
-            .or_else(|| self.project.dpk.as_deref().and_then(lib_suffix_directive));
-        match declared {
-            None => String::new(),
-            Some(suffix) if suffix.eq_ignore_ascii_case("auto") || suffix.eq_ignore_ascii_case("$(Auto)") => {
-                self.compiler.package_version.to_string()
+            .map(|suffix| suffix.trim())
+            .filter(|suffix| !suffix.is_empty());
+        if let Some(suffix) = from_dproj {
+            if has_unresolved_macro(suffix) {
+                report.warn_unresolved("The dproj's DllSuffix", suffix);
+                return String::new();
             }
-            Some(suffix) => {
-                let expanded = self.macros.expand(&suffix);
-                if expanded.contains("$(") { String::new() } else { expanded }
+            return suffix.to_string();
+        }
+        let Some(main_source) = self.project.dpk.as_deref().or(self.project.dpr.as_deref()) else {
+            return String::new();
+        };
+        let source = match std::fs::read(main_source) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return String::new(),
+            Err(error) => {
+                report.warn(format!(
+                    "Could not read {main_source} ({error}) to look for a {{$LIBSUFFIX}}; the module name may lack its suffix."
+                ));
+                return String::new();
+            }
+        };
+        match lib_suffix::declared_suffix(&source, &self.build_symbols()) {
+            DeclaredSuffix::None => String::new(),
+            DeclaredSuffix::Literal(suffix) => suffix,
+            DeclaredSuffix::Auto => self.compiler.package_version.to_string(),
+            DeclaredSuffix::Ambiguous(candidates) => {
+                report.warn(format!(
+                    "{main_source} declares several {{$LIBSUFFIX}} values ({}) under conditions DevKit cannot \
+                     evaluate; the module name is given without a suffix and may be wrong.",
+                    candidates.join(", ")
+                ));
+                String::new()
             }
         }
+    }
+
+    /// The conditional symbols in effect for this build: the compiler's
+    /// version symbol, the platform's, and the project's own defines.
+    fn build_symbols(&self) -> BuildSymbols {
+        let mut defined = vec![self.compiler.condition.clone(), "MSWINDOWS".to_string(), "CONDITIONALEXPRESSIONS".to_string()];
+        let platform_symbols: &[&str] = match self.platform.to_lowercase().as_str() {
+            "win32" => &["WIN32", "CPUX86", "CPU386", "CPU32BITS"],
+            "win64" | "win64x" => &["WIN64", "CPUX64", "CPU64BITS"],
+            _ => &[],
+        };
+        defined.extend(platform_symbols.iter().map(|symbol| symbol.to_string()));
+        let project_defines = self.group.as_ref().and_then(|group| group.dcc_options.define.clone()).unwrap_or_default();
+        defined.extend(project_defines.split(';').map(str::trim).filter(|symbol| !symbol.is_empty()).map(str::to_string));
+        BuildSymbols { defined, compiler_version: self.compiler.compiler_version as f64 }
     }
 
     // ─── Modules ─────────────────────────────────────────────────────────
 
     /// A program started by a Host Application is still the module whose
     /// symbols matter; the host launches it, DevKit knows where it is.
-    fn hosted_program_module(&self, warnings: &mut Vec<String>) -> Option<DebugModule> {
+    fn hosted_program_module(&self, report: &mut Report) -> DebugModule {
         let Some(exe) = self.project.exe.as_deref() else {
-            warnings.push(format!(
+            report.warn(format!(
                 "Program \"{}\" is started by a Host Application but has no executable of its own recorded. Compile it first.",
                 self.project.name
             ));
-            return Some(DebugModule {
-                name: format!("{}.exe", self.project.name),
-                binary: None,
-                map: None,
-                rsm: None,
-                dcp: None,
-            });
+            return unbuilt_module(format!("{}.exe", self.output_stem()));
         };
         if !Path::new(exe).exists() {
-            warnings.push(format!("Executable not found: {exe}. Compile the project first."));
-        } else {
-            check_module_artefacts(exe, warnings);
+            report.warn(format!("Executable not found: {exe}. Compile the project first."));
+            return unbuilt_module(file_name(exe));
         }
-        Some(DebugModule {
-            name: file_name(exe),
-            binary: Some(json_path(exe)),
-            map: Some(json_path(&sibling(exe, "map"))),
-            rsm: Some(json_path(&sibling(exe, "rsm"))),
-            dcp: None,
-        })
+        built_module(exe, None, report)
     }
 
-    /// The package's own `.bpl`, searched where the IDE puts one — the
-    /// dproj's `DCC_BplOutput`, the IDE's default package output, the
-    /// hosting executable's directory, `.\<Platform>\<Config>` — and its
-    /// `.dcp`. Without a built `.bpl` the debugger treats the package as a
-    /// black box, so that is a warning, not an error.
-    fn package_module(&self, host: &str, warnings: &mut Vec<String>) -> Option<DebugModule> {
-        let bpl_name = format!("{}.bpl", self.binary_stem());
+    /// The package's own `.bpl`, searched where a build puts one — the
+    /// dproj's `DCC_BplOutput`, the IDE's default package output,
+    /// `.\<Platform>\<Config>` — and, last, in the hosting executable's
+    /// directory; with its `.dcp`. Without a built `.bpl` the debugger
+    /// treats the package as a black box, so that is a warning, not an error.
+    fn package_module(&self, host: &str, report: &mut Report) -> DebugModule {
+        let bpl_name = format!("{}.bpl", self.binary_stem(report));
+        let host_directory = Path::new(host).parent().map(Path::to_path_buf);
         let mut directories = Vec::new();
-        push_dir(&mut directories, self.dproj_output(|options| options.bpl_output.clone()));
-        push_dir(&mut directories, self.expanded_dir(self.library.package_dpl_output.as_deref()));
+        self.push_dproj_output(&mut directories, "DCC_BplOutput", |options| options.bpl_output.clone(), report);
+        self.push_ide_output(&mut directories, "Package DPL Output", self.library.package_dpl_output.as_deref(), report);
         directories.extend(self.common_output_dirs("Bpl"));
-        push_dir(&mut directories, Path::new(host).parent().map(Path::to_path_buf));
         directories.push(PathBuf::from(&self.project.directory).join(&self.platform).join(&self.config));
+        directories.extend(host_directory.clone());
 
         let Some(binary) = find_built_file(&directories, &bpl_name) else {
             let searched: Vec<String> = directories.iter().map(|d| d.to_string_lossy().to_string()).collect();
-            warnings.push(format!(
+            report.warn(format!(
                 "No built {bpl_name} found for package \"{}\" (searched: {}). Compile it first, or the debugger will treat it as a black box.",
                 self.project.name,
                 searched.join("; ")
             ));
-            return Some(DebugModule { name: bpl_name, binary: None, map: None, rsm: None, dcp: None });
+            return unbuilt_module(bpl_name);
         };
-        check_module_artefacts(&binary, warnings);
+        if let Some(host_directory) = host_directory {
+            warn_about_a_different_copy(&binary, &host_directory.join(&bpl_name), report);
+        }
 
-        let dcp_name = format!("{}.dcp", self.project.name);
+        let dcp_name = format!("{}.dcp", self.output_stem());
         let mut dcp_directories = Vec::new();
-        push_dir(&mut dcp_directories, self.dproj_output(|options| options.dcp_output.clone()));
-        push_dir(&mut dcp_directories, self.expanded_dir(self.library.package_dcp_output.as_deref()));
+        self.push_dproj_output(&mut dcp_directories, "DCC_DcpOutput", |options| options.dcp_output.clone(), report);
+        self.push_ide_output(&mut dcp_directories, "Package DCP Output", self.library.package_dcp_output.as_deref(), report);
         dcp_directories.extend(self.common_output_dirs("Dcp"));
-        push_dir(&mut dcp_directories, Path::new(&binary).parent().map(Path::to_path_buf));
+        dcp_directories.extend(Path::new(&binary).parent().map(Path::to_path_buf));
         let dcp = find_built_file(&dcp_directories, &dcp_name);
         if dcp.is_none() {
-            warnings.push(format!(
+            report.warn(format!(
                 "No {dcp_name} found for package \"{}\": the debugger will lack the package's rich debug information.",
                 self.project.name
             ));
         }
-
-        Some(DebugModule {
-            name: file_name(&binary),
-            map: Some(json_path(&sibling(&binary, "map"))),
-            rsm: Some(json_path(&sibling(&binary, "rsm"))),
-            dcp: dcp.as_deref().map(json_path),
-            binary: Some(json_path(&binary)),
-        })
+        built_module(&binary, dcp, report)
     }
 
     /// The DLL a library project builds: DevKit records its output as the
     /// program-style `<stem>.exe`; the DLL sits in the same directory.
-    fn library_module(&self, warnings: &mut Vec<String>) -> Option<DebugModule> {
-        let dll_name = format!("{}.dll", self.binary_stem());
+    fn library_module(&self, report: &mut Report) -> DebugModule {
+        let dll_name = format!("{}.dll", self.binary_stem(report));
         let output_dir = self
             .project
             .exe
@@ -509,52 +666,69 @@ impl<'a> TargetContext<'a> {
             .and_then(|exe| Path::new(exe).parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from(&self.project.directory).join(&self.platform).join(&self.config));
         let Some(binary) = find_built_file(&[output_dir.clone()], &dll_name) else {
-            warnings.push(format!(
+            report.warn(format!(
                 "No built {dll_name} found for library \"{}\" in {}. Compile it first, or the debugger will treat it as a black box.",
                 self.project.name,
                 output_dir.to_string_lossy()
             ));
-            return Some(DebugModule { name: dll_name, binary: None, map: None, rsm: None, dcp: None });
+            return unbuilt_module(dll_name);
         };
-        check_module_artefacts(&binary, warnings);
-        Some(DebugModule {
-            name: file_name(&binary),
-            map: Some(json_path(&sibling(&binary, "map"))),
-            rsm: Some(json_path(&sibling(&binary, "rsm"))),
-            dcp: None,
-            binary: Some(json_path(&binary)),
-        })
+        built_module(&binary, None, report)
     }
 
-    /// One expanded, absolutized output directory read from the dproj's
-    /// merged property group (dproj-rs has already expanded `$(…)` there).
-    fn dproj_output(&self, select: impl Fn(&dproj_rs::dproj::DccOptions) -> Option<String>) -> Option<PathBuf> {
-        let raw = self.group.as_ref().and_then(|group| select(&group.dcc_options))?;
-        self.expanded_dir(Some(&raw))
+    /// Adds an output directory the dproj's merged property group names.
+    fn push_dproj_output(
+        &self,
+        directories: &mut Vec<PathBuf>,
+        property: &str,
+        select: impl Fn(&dproj_rs::dproj::DccOptions) -> Option<String>,
+        report: &mut Report,
+    ) {
+        let raw = self.group.as_ref().and_then(|group| select(&group.dcc_options));
+        self.push_output(directories, &format!("The dproj's {property}"), raw.as_deref(), report);
     }
 
-    /// Expands and absolutizes a directory value; `None` when a macro stays
-    /// unresolved (not a usable directory).
-    fn expanded_dir(&self, raw: Option<&str>) -> Option<PathBuf> {
-        let raw = raw?.trim();
+    /// Adds an output directory the IDE's library settings name.
+    fn push_ide_output(&self, directories: &mut Vec<PathBuf>, setting: &str, raw: Option<&str>, report: &mut Report) {
+        self.push_output(directories, &format!("The IDE's {setting}"), raw, report);
+    }
+
+    fn push_output(&self, directories: &mut Vec<PathBuf>, what: &str, raw: Option<&str>, report: &mut Report) {
+        match self.directory(raw) {
+            Directory::Found(dir) => directories.push(dir),
+            Directory::Unresolved(value) => report.warn_unresolved(what, &value),
+            Directory::Blank => {}
+        }
+    }
+
+    /// Expands and absolutizes a directory value. A relative one is taken
+    /// from the project directory: that is the compiler's working directory,
+    /// for the dproj's paths and for the IDE's alike.
+    fn directory(&self, raw: Option<&str>) -> Directory {
+        let raw = raw.map(str::trim).unwrap_or("");
         if raw.is_empty() {
-            return None;
+            return Directory::Blank;
         }
         let expanded = self.macros.expand(raw);
-        if expanded.contains("$(") {
-            return None;
+        if has_unresolved_macro(&expanded) {
+            return Directory::Unresolved(expanded);
         }
-        Some(absolutize(&expanded, &self.project.directory))
+        Directory::Found(absolutize(&expanded, &self.project.directory))
     }
 
-    /// `$(BDSCOMMONDIR)\<kind>\<platform>` then `$(BDSCOMMONDIR)\<kind>`: the
-    /// IDE's default package output, platform subdirectory first (Win32
-    /// builds land in the root).
+    /// The IDE's default package output: `$(BDSCOMMONDIR)\<kind>\<platform>`,
+    /// and the root `$(BDSCOMMONDIR)\<kind>` for Win32 only — that is where
+    /// Win32 builds land, so for any other platform a file there is another
+    /// platform's build.
     fn common_output_dirs(&self, kind: &str) -> Vec<PathBuf> {
-        let Some(root) = self.expanded_dir(Some(&format!("$(BDSCOMMONDIR)\\{kind}"))) else {
+        let Directory::Found(root) = self.directory(Some(&format!("$(BDSCOMMONDIR)\\{kind}"))) else {
             return Vec::new();
         };
-        vec![root.join(&self.platform), root]
+        let mut directories = vec![root.join(&self.platform)];
+        if self.platform.eq_ignore_ascii_case("Win32") {
+            directories.push(root);
+        }
+        directories
     }
 
     // ─── Sources ─────────────────────────────────────────────────────────
@@ -565,31 +739,59 @@ impl<'a> TargetContext<'a> {
     /// attributed to the `.inc` file, so the debugger must find it too), the
     /// IDE's Library Path and Browsing Path for the platform — the browsing
     /// path is where the sources behind third-party components live — and
-    /// the compiler's own `source` tree. Only existing directories are kept.
-    fn source_search_paths(&self) -> Vec<String> {
-        let mut paths = Vec::new();
-        push_unique(&mut paths, PathBuf::from(&self.project.directory));
-        let dproj_paths = [
-            self.group.as_ref().and_then(|group| group.dcc_options.unit_search_path.clone()),
-            self.group.as_ref().and_then(|group| group.dcc_options.include_path.clone()),
+    /// the compiler's own `source` tree. Only existing directories are
+    /// kept; what was left out is reported.
+    fn source_search_paths(&self, report: &mut Report) -> Vec<String> {
+        let dcc_options = self.group.as_ref().map(|group| &group.dcc_options);
+        let lists = [
+            ("the dproj's unit search path", dcc_options.and_then(|options| options.unit_search_path.clone())),
+            ("the dproj's include path", dcc_options.and_then(|options| options.include_path.clone())),
+            ("the IDE's Library Path", self.library.search_path.clone()),
+            ("the IDE's Browsing Path", self.library.browsing_path.clone()),
+            ("the compiler's source tree", Some("$(BDS)\\source".to_string())),
         ];
-        let ide_paths = [self.library.search_path.clone(), self.library.browsing_path.clone()];
-        for list in dproj_paths.into_iter().chain(ide_paths).flatten() {
-            for entry in list.split(';') {
-                if let Some(dir) = self.expanded_dir(Some(entry)) {
-                    push_unique(&mut paths, dir);
+        let mut candidates = vec![normalize_path(&self.project.directory)];
+        let mut unresolved: Vec<String> = Vec::new();
+        for (origin, list) in lists {
+            for entry in list.unwrap_or_default().split(';') {
+                match self.directory(Some(entry)) {
+                    Directory::Found(dir) => push_unique(&mut candidates, dir),
+                    Directory::Unresolved(value) => push_once(&mut unresolved, format!("{value} (in {origin})")),
+                    Directory::Blank => {}
                 }
             }
         }
-        if let Some(dir) = self.expanded_dir(Some("$(BDS)\\source")) {
-            push_unique(&mut paths, dir);
+        if !unresolved.is_empty() {
+            report.warn(format!(
+                "{} source search path entries depend on a $(NAME) nothing defines and were left out: {}.",
+                unresolved.len(),
+                summary(&unresolved)
+            ));
         }
-        paths
-            .into_iter()
-            .filter(|dir| dir.is_dir())
-            .map(|dir| json_path(&dir.to_string_lossy()))
-            .collect()
+        let (existing, missing): (Vec<PathBuf>, Vec<PathBuf>) = candidates.into_iter().partition(|dir| dir.is_dir());
+        if !missing.is_empty() {
+            let missing: Vec<String> = missing.iter().map(|dir| dir.to_string_lossy().to_string()).collect();
+            report.note(format!(
+                "{} source search path entries do not exist and were left out: {}.",
+                missing.len(),
+                summary(&missing)
+            ));
+        }
+        if existing.is_empty() {
+            report.warn("No source directory exists for this project: a debugger will show no source.");
+        }
+        existing.iter().map(|dir| json_path(&dir.to_string_lossy())).collect()
     }
+}
+
+/// The first few of `items`, and how many more there are.
+fn summary(items: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let shown = items.iter().take(SHOWN).cloned().collect::<Vec<_>>().join("; ");
+    if items.len() <= SHOWN {
+        return shown;
+    }
+    format!("{shown}; and {} more", items.len() - SHOWN)
 }
 
 // ─── Project evaluation helpers ──────────────────────────────────────────────
@@ -604,76 +806,137 @@ fn effective_config_platform(project: &Project, dproj: Option<&dproj_rs::Dproj>)
     }
 }
 
-lazy_static::lazy_static! {
-    /// `{$LIBSUFFIX '290'}` or `{$LIBSUFFIX AUTO}` in a `.dpk`.
-    static ref LIBSUFFIX_DIRECTIVE: regex::Regex =
-        regex::Regex::new(r"(?i)\{\$LIBSUFFIX\s+(?:'(?P<quoted>[^']*)'|(?P<auto>AUTO))\s*\}").unwrap();
+/// `$(ProjectName)` is the project file's name, whatever the project is
+/// called in DevKit.
+fn project_file_stem(project: &Project) -> String {
+    [&project.dproj, &project.dpr, &project.dpk]
+        .into_iter()
+        .flatten()
+        .find_map(|file| Path::new(file).file_stem())
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| project.name.clone())
 }
 
-/// The `LIBSUFFIX` a main source declares itself, when it does.
-fn lib_suffix_directive(dpk_path: &str) -> Option<String> {
-    let source = std::fs::read_to_string(dpk_path).ok()?;
-    let captures = LIBSUFFIX_DIRECTIVE.captures(&source)?;
-    if captures.name("auto").is_some() {
-        return Some("AUTO".to_string());
+/// A platform the dproj does not enable is one the project does not build:
+/// its settings come from no property group of its own, and whatever sits
+/// in its output directory was not made by this project's options.
+fn warn_about_an_unsupported_platform(dproj: &dproj_rs::Dproj, platform: &str, report: &mut Report) {
+    let platforms = dproj.platforms();
+    let enabled: Vec<&str> = platforms.iter().filter(|(_, enabled)| *enabled).map(|(name, _)| *name).collect();
+    if platforms.is_empty() || enabled.iter().any(|name| name.eq_ignore_ascii_case(platform)) {
+        return;
     }
-    captures.name("quoted").map(|m| m.as_str().trim().to_string())
+    report.warn(format!(
+        "Platform {platform} is not enabled for this project (the dproj enables: {}); what is described is a \
+         build the project does not produce.",
+        if enabled.is_empty() { "none".to_string() } else { enabled.join(", ") }
+    ));
 }
 
 // ─── Artefact checks ─────────────────────────────────────────────────────────
 
-/// Flags a missing executable and, when it is the project's own program,
-/// missing or stale `.map`/`.rsm` next to it. A host application's symbols
-/// are optional: it is the loaded module that matters then.
-fn check_executable_artefacts(executable: &str, own_program: bool, warnings: &mut Vec<String>) {
-    if !Path::new(executable).exists() {
-        warnings.push(format!("Executable not found: {executable}. Compile the project first."));
+/// The module at `binary`, with the symbol files found next to it.
+fn built_module(binary: &str, dcp: Option<String>, report: &mut Report) -> DebugModule {
+    let symbols = symbols_next_to(binary, &file_name(binary), true, report);
+    DebugModule {
+        name: file_name(binary),
+        binary: Some(json_path(binary)),
+        map: symbols.map,
+        rsm: symbols.rsm,
+        dcp: dcp.as_deref().map(json_path),
+    }
+}
+
+fn unbuilt_module(name: String) -> DebugModule {
+    DebugModule { name, binary: None, map: None, rsm: None, dcp: None }
+}
+
+/// How far apart a binary and its symbol file may be written before they
+/// cannot belong to the same build. Within one build the linker writes the
+/// `.map` and `.rsm` *before* it finishes the executable (measured: 0.3–0.6 s
+/// earlier on an MSBuild build of a mid-sized program), and a large link
+/// takes longer than that, so only a wider gap is reported.
+const SAME_BUILD_TOLERANCE: Duration = Duration::from_secs(5 * 60);
+
+/// The `.map` and `.rsm` found next to `binary` (called `what` in the
+/// messages). A file that exists but cannot belong to the binary — empty,
+/// or written by another build — is reported and not returned: symbols left
+/// over from an earlier build are worse than none, breakpoints land on wrong
+/// lines and locals read as garbage. A missing file is a warning only when
+/// the symbols are `required`.
+fn symbols_next_to(binary: &str, what: &str, required: bool, report: &mut Report) -> SymbolFiles {
+    let binary_time = std::fs::metadata(binary).and_then(|metadata| metadata.modified()).ok();
+    let mut find = |extension: &str, effect: &str| -> Option<String> {
+        let path = sibling(binary, extension);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if required {
+                    report.warn(format!(
+                        "Missing .{extension} next to {what} ({effect}). Compile with debug info (Compile for Debugging)."
+                    ));
+                }
+                return None;
+            }
+            Err(error) => {
+                report.warn(format!("Could not inspect {path} ({error}); it was not used."));
+                return None;
+            }
+        };
+        if metadata.len() == 0 {
+            report.warn(format!(
+                "The .{extension} next to {what} is empty, as a build that failed leaves it. Recompile with debug info (Compile for Debugging)."
+            ));
+            return None;
+        }
+        if let Some(problem) = written_by_another_build(binary_time, metadata.modified().ok()) {
+            report.warn(format!(
+                "The .{extension} next to {what} is {problem}: symbols of another build make breakpoints land on \
+                 wrong lines. Recompile with debug info (Compile for Debugging)."
+            ));
+            return None;
+        }
+        Some(json_path(&path))
+    };
+    SymbolFiles {
+        map: find("map", "no source lines: breakpoints and stepping will not work"),
+        rsm: find("rsm", "variable inspection and expression evaluation will be severely limited"),
+    }
+}
+
+/// Says how a symbol file's time rules out the binary's build, if it does.
+/// Times that cannot be read or compared rule nothing out.
+fn written_by_another_build(binary: Option<SystemTime>, symbols: Option<SystemTime>) -> Option<&'static str> {
+    let (binary, symbols) = (binary?, symbols?);
+    match binary.duration_since(symbols) {
+        Ok(older_by) if older_by > SAME_BUILD_TOLERANCE => Some("older than the binary"),
+        Ok(_) => None,
+        Err(newer) if newer.duration() > SAME_BUILD_TOLERANCE => {
+            Some("newer than the binary, as a build that did not finish linking leaves it")
+        }
+        Err(_) => None,
+    }
+}
+
+/// The host loads the copy in its own directory before any other: when that
+/// copy is not the file described, the symbols described are not the ones
+/// of the code that will run.
+fn warn_about_a_different_copy(described: &str, in_host_directory: &Path, report: &mut Report) {
+    let same_file = normalize_path(in_host_directory)
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&normalize_path(described).to_string_lossy());
+    if same_file || !in_host_directory.is_file() {
         return;
     }
-    if own_program {
-        check_symbols_next_to(executable, "the executable", warnings);
+    let fingerprint = |path: &Path| std::fs::metadata(path).ok().map(|metadata| (metadata.len(), metadata.modified().ok()));
+    if fingerprint(in_host_directory) == fingerprint(Path::new(described)) {
+        return;
     }
-}
-
-fn check_module_artefacts(binary: &str, warnings: &mut Vec<String>) {
-    check_symbols_next_to(binary, &file_name(binary), warnings);
-}
-
-/// How much older than its binary a symbol file may be before it counts as
-/// stale. Within one build the linker writes the `.map` and `.rsm` *before*
-/// it finishes the executable (measured: 0.3–0.6 s earlier on an MSBuild
-/// build of a mid-sized program), and a large link takes longer than that, so
-/// only a gap that cannot belong to the same build is reported.
-const STALE_SYMBOLS_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-/// Missing symbols cost features; symbols left over from an earlier build are
-/// worse — breakpoints land on wrong lines and locals read as garbage.
-fn check_symbols_next_to(binary: &str, what: &str, warnings: &mut Vec<String>) {
-    let binary_time = modified_time(binary).map(|time| time - STALE_SYMBOLS_TOLERANCE);
-    for (extension, effect) in [
-        ("map", "no source lines: breakpoints and stepping will not work"),
-        ("rsm", "variable inspection and expression evaluation will be severely limited"),
-    ] {
-        let symbol_file = sibling(binary, extension);
-        if !Path::new(&symbol_file).exists() {
-            warnings.push(format!(
-                "Missing .{extension} next to {what} ({effect}). Compile with debug info (Compile for Debugging)."
-            ));
-            continue;
-        }
-        if let (Some(binary_time), Some(symbol_time)) = (binary_time, modified_time(&symbol_file)) {
-            if symbol_time < binary_time {
-                warnings.push(format!(
-                    "The .{extension} next to {what} is older than the binary: stale symbols make breakpoints land on \
-                     wrong lines. Recompile with debug info (Compile for Debugging)."
-                ));
-            }
-        }
-    }
-}
-
-fn modified_time(path: &str) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok()
+    report.warn(format!(
+        "{} is a different file from the one described ({described}), and it is the one the host loads: the \
+         symbols described will not match the running code. Remove or update that copy.",
+        in_host_directory.to_string_lossy()
+    ));
 }
 
 // ─── File helpers ────────────────────────────────────────────────────────────
@@ -693,12 +956,6 @@ fn absolutize(dir: &str, base: &str) -> PathBuf {
     let path = PathBuf::from(dir);
     let absolute = if path.is_relative() { PathBuf::from(base).join(path) } else { path };
     normalize_path(absolute)
-}
-
-fn push_dir(directories: &mut Vec<PathBuf>, dir: Option<PathBuf>) {
-    if let Some(dir) = dir {
-        directories.push(dir);
-    }
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -728,284 +985,4 @@ fn json_path(path: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use std::fs;
-
-    /// A Delphi 12 installation that exists only as values: no disk, no registry.
-    struct FakeIde {
-        environment: Option<IdeEnvironment>,
-        library: IdeLibrarySettings,
-    }
-
-    impl FakeIde {
-        fn new() -> Self {
-            let rsvars: HashMap<String, String> = [
-                ("BDS", r"C:\Delphi\23.0"),
-                ("BDSCOMMONDIR", r"C:\Users\Public\Documents\Embarcadero\Studio\23.0"),
-            ]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-            FakeIde {
-                environment: Some(IdeEnvironment { rsvars, ..Default::default() }),
-                library: IdeLibrarySettings::default(),
-            }
-        }
-
-        fn with_variable(mut self, name: &str, value: &str) -> Self {
-            if let Some(environment) = &mut self.environment {
-                environment.ide_variables.push((name.to_string(), value.to_string()));
-            }
-            self
-        }
-
-        fn unavailable() -> Self {
-            FakeIde { environment: None, library: IdeLibrarySettings::default() }
-        }
-    }
-
-    impl IdeSettings for FakeIde {
-        fn environment(&self) -> Result<IdeEnvironment> {
-            self.environment.clone().ok_or_else(|| anyhow::anyhow!("rsvars.bat not found"))
-        }
-
-        fn library_settings(&self, _platform: &str) -> IdeLibrarySettings {
-            self.library.clone()
-        }
-    }
-
-    fn compiler() -> CompilerConfiguration {
-        CompilerConfiguration {
-            condition: "VER360".into(),
-            product_name: "Delphi 12.0 Athens".into(),
-            product_version: 23,
-            package_version: 290,
-            compiler_version: 36,
-            installation_path: r"C:\Delphi\23.0".into(),
-            build_arguments: Vec::new(),
-        }
-    }
-
-    fn project(dir: &Path, name: &str) -> Project {
-        Project { id: 7, name: name.into(), directory: dir.to_string_lossy().to_string(), ..Default::default() }
-    }
-
-    fn touch(path: PathBuf) -> String {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"x").unwrap();
-        path.to_string_lossy().to_string()
-    }
-
-    /// The `TestPkg64.dproj` fixture: a package whose Debug/Win64 host is
-    /// `$(VEGADIR)\FieldHost64.exe`, `-flag1` as run parameters, unit search
-    /// path `.\$(Platform)\$(Config)`.
-    fn package_from_fixture(dir: &Path) -> Project {
-        let dproj = dir.join("TestPkg64.dproj");
-        fs::write(&dproj, include_str!("../../tests/fixtures/TestPkg64.dproj")).unwrap();
-        fs::write(dir.join("TestPkg.dpk"), "package TestPkg;\nend.\n").unwrap();
-        let mut project = project(dir, "TestPkg64");
-        project.dproj = Some(dproj.to_string_lossy().to_string());
-        project.dpk = Some(dir.join("TestPkg.dpk").to_string_lossy().to_string());
-        project
-    }
-
-    #[test]
-    fn a_program_target_lists_its_exe_and_symbols() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = touch(tmp.path().join("Demo.exe"));
-        let mut project = project(tmp.path(), "Demo");
-        project.dpr = Some(tmp.path().join("Demo.dpr").to_string_lossy().to_string());
-        project.exe = Some(exe);
-        project.dproj_run_params = Some("-a".into());
-        project.start_parameters = Some("\"b c\"".into());
-
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap();
-        assert_eq!(target.kind, DebugTargetKind::Program);
-        assert_eq!(target.bitness, Some(32));
-        assert!(target.executable.ends_with("/Demo.exe"));
-        assert!(target.symbols.rsm.ends_with("/Demo.rsm"));
-        assert_eq!(target.args, vec!["-a", "b c"]);
-        assert!(target.modules.is_empty());
-        assert_eq!(target.source_search_paths[0], json_path(&normalize_path(tmp.path()).to_string_lossy()));
-        assert!(target.warnings.iter().any(|w| w.contains("Missing .map")));
-    }
-
-    #[test]
-    fn a_program_with_a_host_application_keeps_its_own_symbols_as_a_module() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = touch(tmp.path().join("out").join("Plugin.exe"));
-        touch(tmp.path().join("out").join("Plugin.map"));
-        let host = touch(tmp.path().join("Host.exe"));
-        let mut project = project(tmp.path(), "Plugin");
-        project.exe = Some(exe);
-        project.host_application = Some(host);
-
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap();
-        assert_eq!(target.kind, DebugTargetKind::Program);
-        assert!(target.executable.ends_with("/Host.exe"));
-        // The host's symbols are not the program's: nothing is expected next to it.
-        assert!(!target.warnings.iter().any(|w| w.contains("the executable")), "{:?}", target.warnings);
-        let module = &target.modules[0];
-        assert_eq!(module.name, "Plugin.exe");
-        assert!(module.map.as_deref().unwrap().ends_with("/out/Plugin.map"));
-        assert!(target.warnings.iter().any(|w| w.contains("Plugin.exe") && w.contains("Missing .rsm")));
-    }
-
-    #[test]
-    fn a_package_target_resolves_host_platform_and_search_paths_from_the_dproj() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project = package_from_fixture(tmp.path());
-        fs::create_dir_all(tmp.path().join("Win64").join("Debug")).unwrap();
-        let ide = FakeIde::new().with_variable("VEGADIR", r"C:\Athens\hydra_2");
-
-        // Nothing persisted about the host: the dproj is read live, for the
-        // dproj's default platform (Win64), with the IDE variable expanded.
-        let target = build_debug_target_with(&project, &compiler(), &ide).unwrap();
-        assert_eq!(target.kind, DebugTargetKind::Package);
-        assert_eq!((target.config.as_str(), target.platform.as_str(), target.bitness), ("Debug", "Win64", Some(64)));
-        assert_eq!(target.executable.to_lowercase(), "c:/athens/hydra_2/fieldhost64.exe");
-        assert_eq!(target.host_application, Some(target.executable.clone()));
-        assert_eq!(target.modules[0].name, "TestPkg64.bpl");
-        assert!(target.modules[0].binary.is_none());
-        let unit_output = json_path(&normalize_path(tmp.path().join("Win64").join("Debug")).to_string_lossy());
-        assert!(target.source_search_paths.contains(&unit_output), "{:?}", target.source_search_paths);
-        assert!(target.warnings.iter().any(|w| w.contains("Executable not found")));
-        assert!(target.warnings.iter().any(|w| w.contains("No built TestPkg64.bpl")));
-    }
-
-    #[test]
-    fn a_package_target_uses_the_persisted_state_and_finds_its_bpl_next_to_the_host() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut project = package_from_fixture(tmp.path());
-        let ide_env = vec![("VEGADIR".to_string(), tmp.path().join("vega").to_string_lossy().to_string())];
-        project.discover_paths(&ide_env).unwrap();
-        let host = touch(tmp.path().join("vega").join("FieldHost64.exe"));
-        touch(tmp.path().join("vega").join("TestPkg64.bpl"));
-        touch(tmp.path().join("vega").join("TestPkg64.dcp"));
-        let ide = FakeIde::new().with_variable("VEGADIR", &tmp.path().join("vega").to_string_lossy());
-
-        let target = build_debug_target_with(&project, &compiler(), &ide).unwrap();
-        assert_eq!(target.executable, json_path(&normalize_path(&host).to_string_lossy()));
-        assert_eq!(target.args, vec!["-flag1"]);
-        let module = &target.modules[0];
-        assert!(module.binary.as_deref().unwrap().ends_with("/vega/TestPkg64.bpl"));
-        assert!(module.dcp.as_deref().unwrap().ends_with("/vega/TestPkg64.dcp"));
-        assert!(target.warnings.iter().any(|w| w.contains("TestPkg64.bpl") && w.contains("Missing .map")));
-
-        // Describing another platform re-reads the host for it: the dproj's
-        // Debug host is `$(ProjectDir)\hosts\DebugHost.exe`, not the Win64 one.
-        project.active_platform = Some("Win32".into());
-        let target = build_debug_target_with(&project, &compiler(), &ide).unwrap();
-        assert_eq!(target.platform, "Win32");
-        assert!(target.executable.ends_with("/hosts/DebugHost.exe"), "{}", target.executable);
-    }
-
-    #[test]
-    fn a_package_with_an_automatic_libsuffix_is_found_by_its_exact_name_in_the_bpl_output() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dproj = tmp.path().join("TestPkgSuffix.dproj");
-        fs::write(&dproj, include_str!("../../tests/fixtures/TestPkgSuffix.dproj")).unwrap();
-        let dpk = tmp.path().join("TestPkgSuffix.dpk");
-        fs::write(&dpk, "package TestPkgSuffix;\nend.\n").unwrap();
-        let mut project = project(tmp.path(), "TestPkgSuffix");
-        project.dproj = Some(dproj.to_string_lossy().to_string());
-        project.dpk = Some(dpk.to_string_lossy().to_string());
-        touch(tmp.path().join("hosts").join("Host.exe"));
-        // A stale namesake that a prefix match would have preferred.
-        touch(tmp.path().join("bpl").join("TestPkgSuffixOld.bpl"));
-        touch(tmp.path().join("bpl").join("TestPkgSuffix290.bpl"));
-        touch(tmp.path().join("dcp").join("TestPkgSuffix.dcp"));
-        fs::create_dir_all(tmp.path().join("inc")).unwrap();
-
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap();
-        assert!(target.executable.ends_with("/hosts/Host.exe"));
-        let module = &target.modules[0];
-        assert_eq!(module.name, "TestPkgSuffix290.bpl");
-        assert!(module.binary.as_deref().unwrap().ends_with("/bpl/TestPkgSuffix290.bpl"));
-        assert!(module.dcp.as_deref().unwrap().ends_with("/dcp/TestPkgSuffix.dcp"));
-        let include = json_path(&normalize_path(tmp.path().join("inc")).to_string_lossy());
-        assert!(target.source_search_paths.contains(&include), "{:?}", target.source_search_paths);
-    }
-
-    #[test]
-    fn a_libsuffix_directive_in_the_dpk_names_the_bpl_when_the_dproj_is_silent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dpk = tmp.path().join("Demo.dpk");
-        fs::write(&dpk, "package Demo;\n{$LIBSUFFIX 'D29'}\nend.\n").unwrap();
-        let host = touch(tmp.path().join("Host.exe"));
-        touch(tmp.path().join("Host.exe").with_file_name("DemoD29.bpl"));
-        let mut project = project(tmp.path(), "Demo");
-        project.dpk = Some(dpk.to_string_lossy().to_string());
-        project.host_application = Some(host);
-
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap();
-        assert_eq!(target.modules[0].name, "DemoD29.bpl");
-        assert!(target.modules[0].binary.is_some());
-
-        fs::write(&dpk, "package Demo;\n{$LIBSUFFIX AUTO}\nend.\n").unwrap();
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap();
-        assert_eq!(target.modules[0].name, "Demo290.bpl");
-    }
-
-    #[test]
-    fn a_library_target_binds_its_dll() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dproj = tmp.path().join("TestLib.dproj");
-        fs::write(&dproj, include_str!("../../tests/fixtures/TestLib.dproj")).unwrap();
-        let mut project = project(tmp.path(), "TestLib");
-        project.dproj = Some(dproj.to_string_lossy().to_string());
-        // DevKit records a library's output the way it records a program's.
-        project.exe = Some(tmp.path().join("out").join("TestLib.exe").to_string_lossy().to_string());
-        touch(tmp.path().join("Host.exe"));
-        touch(tmp.path().join("out").join("TestLib.dll"));
-
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap();
-        assert_eq!(target.kind, DebugTargetKind::Library, "{:?}", target.warnings);
-        assert!(target.executable.ends_with("/Host.exe"), "{}", target.executable);
-        assert_eq!(target.modules[0].name, "TestLib.dll");
-        assert!(target.modules[0].binary.as_deref().unwrap().ends_with("/out/TestLib.dll"));
-    }
-
-    #[test]
-    fn a_package_without_host_is_an_error_not_a_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut project = project(tmp.path(), "Demo");
-        project.dpk = Some(tmp.path().join("Demo.dpk").to_string_lossy().to_string());
-        let error = build_debug_target_with(&project, &compiler(), &FakeIde::new()).unwrap_err().to_string();
-        assert!(error.contains("Host Application"), "{error}");
-    }
-
-    #[test]
-    fn unreadable_inputs_are_reported_not_swallowed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = touch(tmp.path().join("Demo.exe"));
-        let dproj = tmp.path().join("Demo.dproj");
-        fs::write(&dproj, "<Project><PropertyGroup><Config>").unwrap();
-        let mut project = project(tmp.path(), "Demo");
-        project.dproj = Some(dproj.to_string_lossy().to_string());
-        project.exe = Some(exe);
-
-        let target = build_debug_target_with(&project, &compiler(), &FakeIde::unavailable()).unwrap();
-        assert!(target.warnings.iter().any(|w| w.contains("rsvars.bat not found")), "{:?}", target.warnings);
-        assert!(target.warnings.iter().any(|w| w.contains("Could not evaluate")), "{:?}", target.warnings);
-        assert!(target.warnings.iter().any(|w| w.contains("No IDE Library Path")), "{:?}", target.warnings);
-    }
-
-    #[test]
-    fn symbol_checks_report_missing_and_stale_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("Demo.exe");
-        let map = tmp.path().join("Demo.map");
-        fs::write(&map, b"map").unwrap();
-        fs::write(&exe, b"exe").unwrap();
-        // A map from an earlier build: well outside the same-build tolerance.
-        let an_hour_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
-        fs::File::options().write(true).open(&map).unwrap().set_modified(an_hour_ago).unwrap();
-        let mut warnings = Vec::new();
-        check_executable_artefacts(&exe.to_string_lossy(), true, &mut warnings);
-        assert!(warnings.iter().any(|w| w.contains(".map") && w.contains("older")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("Missing .rsm")), "{warnings:?}");
-    }
-}
+mod tests;

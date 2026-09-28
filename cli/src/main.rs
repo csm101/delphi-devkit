@@ -191,8 +191,11 @@ enum Commands {
     /// to (the program, or the Host Application of a package/DLL), its
     /// .map/.rsm, the project's own .bpl/.dll with their symbols, the source
     /// search paths (dproj + IDE library/browsing paths), the run arguments,
-    /// and warnings about missing or stale artefacts. Debugger-agnostic: a
-    /// debugger integration maps it onto its own launch configuration.
+    /// warnings about what will degrade or break a session, and notes about
+    /// what DDK decided or left out. Every path but the executable's is a
+    /// file that exists; an empty warnings list means ready to debug.
+    /// Debugger-agnostic: a debugger integration maps it onto its own
+    /// launch configuration.
     ///
     /// TARGET may be a project ID, a project name, or a path to a
     /// .dproj/.dpr/.dpk. A path owned by no workspace is described ad-hoc;
@@ -203,16 +206,20 @@ enum Commands {
         /// .dproj/.dpr/.dpk. Omit to use the active project.
         target: Option<String>,
 
-        /// Compiler configuration for an ad-hoc file TARGET: an exact key
-        /// (e.g. "12.0") or product name (e.g. "Delphi 12"). Defaults to the
-        /// newest installed compiler. Only meaningful when TARGET is a file
-        /// that belongs to no workspace.
+        /// Compiler configuration for a project that has none of its own —
+        /// a file TARGET that belongs to no workspace, or a managed project
+        /// linked to no workspace or group project: an exact key (e.g.
+        /// "12.0") or product name (e.g. "Delphi 12"). Defaults to the
+        /// newest installed compiler. A linked project builds with its
+        /// workspace's compiler; the option is then ignored, and the target
+        /// notes it.
         #[arg(long, short = 'c')]
         compiler: Option<String>,
 
         /// Build configuration to describe (e.g. "Debug", "Release") instead
-        /// of the project's active one — the same override `compile` takes,
-        /// so the artefacts described are the ones that build produces.
+        /// of the project's active one — the same override `compile` takes.
+        /// The executable, the Host Application and the run parameters are
+        /// discovered for that build.
         #[arg(long)]
         config: Option<String>,
 

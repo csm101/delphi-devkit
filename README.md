@@ -275,21 +275,50 @@ hanging invisibly. Run such a program from a terminal, or disable
 any particular debugger: the executable to launch or attach to (the program
 itself, or the **Host Application** that loads a package or a DLL), the
 `.map`/`.rsm` symbol files next to it, the project's own `.bpl`/`.dll` module
-with its symbols and `.dcp` (searched where the IDE puts it: the dproj's
-output directories, the IDE's default package output, the host's directory),
-the source search paths (the project directory, the dproj's unit and include
-paths, the IDE's **Library Path** and **Browsing Path** for the platform, the
-compiler's `source` tree — only existing directories, macros expanded through
-`rsvars.bat` and the IDE's environment-variable overrides), the run arguments
-exactly as `Run` passes them, config/platform/bitness, and warnings about
-what is missing or stale (no `.rsm`, a `.map` older than the binary, a package
-that was never built, an unreadable dproj or `rsvars.bat` — every input that
-could not be used is reported, so an empty list really means ready). Nothing
-is written or compiled. The target resolves like `ddk compile`: an ID, a name,
-or a path (ad-hoc when the path belongs to no workspace, `-c` picks its
-compiler), and `--config`/`--platform` describe that configuration and
-platform instead of the project's active ones — the same overrides `compile`
-takes, so what is described is what such a build produces. `--json` is the form a debugger
+with its symbols and `.dcp`, the source search paths (the project directory,
+the dproj's unit and include paths, the IDE's **Library Path** and **Browsing
+Path** for the platform, the compiler's `source` tree — macros expanded
+through `rsvars.bat` and the IDE's environment-variable overrides), the run
+arguments exactly as `Run` passes them, and config/platform/bitness. Nothing
+is written or compiled.
+
+Two rules make the answer safe to act on:
+
+* **A path in it is a file that was found.** `symbols.map`/`symbols.rsm`, and
+  a module's `binary`, `map`, `rsm` and `dcp`, are `null` when the file is not
+  on disk — or is there but cannot belong to the binary: empty, or written by
+  another build (more than five minutes apart from it, either way). The one
+  exception is `executable`, which names the program even before its first
+  build. Search path entries that do not exist are left out.
+* **`warnings` are problems, `notes` are information.** A warning means the
+  session will be degraded or will not work: a missing executable or module,
+  missing, empty or stale symbols, a platform the project does not enable or
+  Windows cannot debug, a value depending on a `$(NAME)` nothing defines, an
+  unreadable dproj or `rsvars.bat`, a different copy of the package sitting
+  in the host's directory. A note explains what DDK decided or left out
+  without harm: the compiler an unlinked project is described with, an IDE
+  path that is not configured, search path entries that do not exist. An
+  empty `warnings` list means ready to debug.
+
+A package or a DLL is named after the project's main source plus its
+`LIBSUFFIX` — the dproj's `DllSuffix` (`$(Auto)` being the compiler's package
+version), else the `{$LIBSUFFIX}` the `.dpk` declares for this compiler and
+platform, conditional directives evaluated — and looked up by that exact name
+in, in order: the dproj's `DCC_BplOutput`, the IDE's *Package DPL Output*,
+`$(BDSCOMMONDIR)\Bpl\<Platform>` (and `$(BDSCOMMONDIR)\Bpl` for Win32, where
+Win32 packages land), the project's `.\<Platform>\<Config>`, and the host's
+directory. The `.dcp` follows the same order through `DCC_DcpOutput`, *Package
+DCP Output* and `$(BDSCOMMONDIR)\Dcp`, ending next to the `.bpl`.
+
+The target resolves like `ddk compile`: an ID, a name, or a path (ad-hoc when
+the path belongs to no workspace). `-c` picks the compiler of a project that
+has none of its own — an ad-hoc path, or a managed project linked to no
+workspace; a linked project builds with its workspace's compiler, and the
+target notes that the option was ignored. `--config`/`--platform` describe
+that configuration and platform instead of the project's active ones: the
+executable, the Host Application and the run parameters are discovered anew
+for that build, so what is described is what such a build produces, never the
+active build's files under another name. `--json` is the form a debugger
 integration consumes: a debug adapter's extension maps it onto its own launch
 attributes, so a hand-written launch configuration shrinks to a project
 reference and stays correct when the project's paths change. The same is
@@ -306,10 +335,17 @@ All of them start the two-line configuration `{ "type": "delphi",
 shape a hand-written `launch.json` entry can use — and the debugger extension
 resolves it by asking DDK for the project's debug target through the
 `ddk.debug.getDebugTarget` command (`executeCommand` with
-`{ project?, compiler? }`). A launch first compiles the project for debugging
-(`ddk.debug.compileBeforeDebug`, on by default); an attach never compiles, and
-when several instances of the executable are running the debugger's own
-process picker chooses. DDK never writes a `launch.json`.
+`{ project?, compiler?, config?, platform? }`, all optional).
+
+A launch first compiles the project for debugging
+(`ddk.debug.compileBeforeDebug`, on by default), **however the session was
+started**: the context menu, the debug dropdown, a `launch.json` entry naming
+a `ddkProject`, or F5 repeating the last session after an edit. The session
+starts only when that build succeeded; a build you cancel cancels the session
+without an error. An attach never compiles, and when several instances of the
+executable are running the debugger's own process picker chooses. Every
+project is offered, built or not, since a launch builds it. DDK never writes a
+`launch.json`.
 
 ## Demos
 

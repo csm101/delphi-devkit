@@ -1683,9 +1683,20 @@ pub async fn cmd_debug_target(
     };
     // An orphan project (linked to no workspace or group project) has no
     // compiler of its own; describing it is read-only, so fall back to the
-    // requested or newest compiler and say so rather than refusing.
-    let (compiler, orphan_note) = match data.compiler_for_project(project_id).await {
-        Some(c) => (c, None),
+    // requested or newest compiler and say so rather than refusing. A
+    // linked project builds with its workspace's compiler, whatever was
+    // requested — which is said too, since the argument had no effect.
+    let (compiler, compiler_note) = match data.compiler_for_project(project_id).await {
+        Some(own) => {
+            let note = compiler.map(|requested| {
+                format!(
+                    "`compiler` ({requested}) was ignored: project \"{}\" builds with {}, the compiler of the \
+                     workspace or group project it belongs to.",
+                    project.name, own.product_name
+                )
+            });
+            (own, note)
+        }
         _ => {
             let key = resolve_compiler_key(compiler).await?;
             let compilers = COMPILER_CONFIGURATIONS.read().await;
@@ -1700,26 +1711,12 @@ pub async fn cmd_debug_target(
             (fallback, Some(note))
         }
     };
-    let described = with_config_platform(project, config, platform);
+    let (described, discovery_warnings) =
+        crate::debug_target::project_to_describe(project, config, platform, &compiler.ide_environment_overrides());
     let mut target = crate::debug_target::build_debug_target(&described, &compiler)?;
-    if let Some(note) = orphan_note {
-        target.warnings.insert(0, note);
-    }
+    target.warnings.splice(0..0, discovery_warnings);
+    target.notes.splice(0..0, compiler_note);
     Ok(DebugTargetOrAmbiguity::Target(target))
-}
-
-/// A copy of `project` with `config`/`platform` in place of its active
-/// configuration and platform, where given. The copy is what gets
-/// described; the managed project is never touched.
-fn with_config_platform(project: &Project, config: Option<String>, platform: Option<String>) -> Project {
-    let mut described = project.clone();
-    if config.is_some() {
-        described.active_configuration = config;
-    }
-    if platform.is_some() {
-        described.active_platform = platform;
-    }
-    described
 }
 
 /// The ad-hoc counterpart of [`cmd_debug_target`] for a project file that
@@ -1747,7 +1744,7 @@ async fn adhoc_debug_target(
 /// workspace on `compiler` (an exact key or product name; default: the
 /// newest installed) holding the file as its only project — the last entry
 /// of `projects` — with `config`/`platform` overriding the dproj's active
-/// ones where given.
+/// ones where given, and the project's paths discovered for them.
 async fn adhoc_project_data(
     file_path: &str,
     compiler: Option<String>,
@@ -1767,12 +1764,18 @@ async fn adhoc_project_data(
         .projects
         .last_mut()
         .ok_or_else(|| anyhow::anyhow!("Failed to create ad-hoc project from: {file_path}"))?;
+    if config.is_none() && platform.is_none() {
+        return Ok(data);
+    }
     if config.is_some() {
         project.active_configuration = config;
     }
     if platform.is_some() {
         project.active_platform = platform;
     }
+    // `new_project` discovered the paths of the dproj's default build; the
+    // executable and the host of the requested one are what is wanted.
+    project.discover_paths(&ide_env)?;
     Ok(data)
 }
 

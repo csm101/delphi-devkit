@@ -931,19 +931,37 @@ mod compile_arguments_tests {
     use super::{dcc_arguments, msbuild_arguments};
 
     fn msbuild(rebuild: bool, debug_info: bool, extra: &[&str]) -> Vec<String> {
+        let build_arguments = ["/verbosity:minimal".to_string(), "/p:DCC_Define=FOO BAR".to_string()];
         let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        msbuild_arguments(r"C:\src\App.dproj", &["/v:q".to_string()], rebuild, "Release", "Win64", debug_info, &extra)
+        msbuild_arguments(r"C:\src\App.dproj", &build_arguments, rebuild, "Release", "Win64", debug_info, &extra)
+    }
+
+    /// What every MSBuild line starts with, whatever else is asked for.
+    fn common(target: &str) -> Vec<&'static str> {
+        vec![
+            r"C:\src\App.dproj",
+            if target == "Build" { "/t:Clean,Build" } else { "/t:Clean,Make" },
+            "/verbosity:minimal",
+            "/p:DCC_Define=FOO BAR",
+            "/p:Config=Release",
+            "/p:Configuration=Release",
+            "/p:Platform=Win64",
+            "/p:DCC_UseMSBuildExternally=true",
+        ]
     }
 
     #[test]
-    fn msbuild_debug_info_puts_the_full_artefact_set_on_the_command_line() {
-        let args = msbuild(false, true, &[]);
-        assert_eq!(args[0], r"C:\src\App.dproj");
-        assert_eq!(args[1], "/t:Clean,Make");
-        assert!(args.contains(&"/v:q".to_string()));
-        assert!(args.contains(&"/p:Config=Release".to_string()));
-        assert!(args.contains(&"/p:Platform=Win64".to_string()));
-        for expected in [
+    fn msbuild_line_of_a_plain_build() {
+        assert_eq!(msbuild(false, false, &[]), common("Make"));
+        assert_eq!(msbuild(true, false, &[]), common("Build"));
+    }
+
+    /// The property set is spelled out here on purpose, not taken from the
+    /// function under test: it is the documented contract of `--debug-info`
+    /// (README, CLI help), and changing it must be a decision, not a typo.
+    #[test]
+    fn msbuild_debug_info_adds_the_documented_properties_before_the_passthrough() {
+        let documented = [
             "/p:DCC_Optimize=false",
             "/p:DCC_DebugInformation=2",
             "/p:DCC_LocalDebugSymbols=true",
@@ -952,19 +970,13 @@ mod compile_arguments_tests {
             "/p:DCC_DebugInfoInExe=true",
             "/p:DCC_RemoteDebug=true",
             "/p:DCC_MapFile=3",
-        ] {
-            assert!(args.iter().any(|a| a == expected), "missing {expected}");
-        }
-        assert!(!msbuild(false, false, &[]).iter().any(|a| a.starts_with("/p:DCC_") && a != "/p:DCC_UseMSBuildExternally=true"));
-        assert_eq!(msbuild(true, false, &[])[1], "/t:Clean,Build");
-    }
-
-    #[test]
-    fn msbuild_user_passthrough_comes_after_the_debug_info_properties() {
-        let args = msbuild(false, true, &["/p:DCC_MapFile=0", "/m"]);
-        let position = |needle: &str| args.iter().position(|a| a == needle).unwrap();
-        assert!(position("/p:DCC_MapFile=0") > position("/p:DCC_MapFile=3"));
-        assert_eq!(args.last().map(String::as_str), Some("/m"));
+        ];
+        let passthrough = ["/p:DCC_MapFile=0", "/m"];
+        let expected: Vec<&str> = common("Make").into_iter().chain(documented).chain(passthrough).collect();
+        assert_eq!(msbuild(false, true, &passthrough), expected);
+        // Without the flag, the passthrough follows the common part directly.
+        let expected: Vec<&str> = common("Make").into_iter().chain(passthrough).collect();
+        assert_eq!(msbuild(false, false, &passthrough), expected);
     }
 
     #[test]

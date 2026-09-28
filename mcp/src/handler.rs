@@ -281,18 +281,25 @@ pub struct GenerateDelphiLspConfigArgs {
         a package/DLL), the .map/.rsm symbol files next to it, the project's own .bpl/.dll module with \
         its symbols and .dcp, the source search paths (project directory, dproj unit/include paths, the \
         IDE's Library and Browsing Paths, the compiler's source tree), the run arguments (dproj Run \
-        Parameters fused with the saved Start Parameters), config/platform/bitness, and warnings about \
-        missing or stale artefacts — and about every input that could not be read (an unparsable \
-        dproj, a missing rsvars.bat), so an empty warnings list means the project is ready to debug. \
+        Parameters fused with the saved Start Parameters) and config/platform/bitness. \
+        Every path in the answer except `executable` is a file that exists: a symbol file, module or \
+        .dcp that is missing, empty or left by another build is null. `warnings` lists what will \
+        degrade or break a session (missing or stale artefacts, a platform the project does not \
+        enable, a value depending on an undefined $(NAME), an input that could not be read); \
+        `notes` lists what is merely worth knowing. An empty `warnings` list means the project is \
+        ready to debug. \
         Use it to build a debugger launch or attach configuration, or to check that readiness. \
         Target it with `project`: a numeric ID, a project name, or a path to a .dproj/.dpr/.dpk \
         (`project_id` is also accepted for an exact numeric target). \
         A name matching several projects returns the candidate list instead. \
         Omit both to describe the currently active project. \
         `config`/`platform` describe that configuration and platform instead of the project's \
-        active ones — the same overrides the compile tools take; nothing is persisted. \
-        A path that belongs to no workspace is described ad-hoc: pick its compiler with `compiler` \
-        (an exact key like \"12.0\" or a product name like \"Delphi 12\"; default: newest installed). \
+        active ones — the same overrides the compile tools take — with the executable and the \
+        host discovered for that build; nothing is persisted. \
+        `compiler` (an exact key like \"12.0\" or a product name like \"Delphi 12\"; default: newest \
+        installed) picks the compiler of a project that has none of its own: a path that belongs to \
+        no workspace, described ad-hoc, or a project linked to no workspace. It is ignored, with a \
+        note, for a project that builds with its workspace's compiler. \
         Nothing is written or compiled: compile with debug_info first if the warnings ask for it."
 )]
 #[derive(Debug, Deserialize, Serialize, macros::JsonSchema)]
@@ -304,7 +311,8 @@ pub struct GetDebugTargetArgs {
     /// Numeric project ID, as an alternative to `project`.
     pub project_id: Option<u64>,
     /// Compiler key (e.g. "12.0") or product name (e.g. "Delphi 12"), used only
-    /// for a file path that belongs to no workspace. Optional.
+    /// for a project without a compiler of its own: a file path that belongs
+    /// to no workspace, or a project linked to no workspace. Optional.
     pub compiler: Option<String>,
     /// Build configuration to describe (e.g. "Debug", "Release") instead of
     /// the project's active one. Optional; nothing is persisted.

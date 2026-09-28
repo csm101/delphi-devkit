@@ -5,11 +5,9 @@
 //!
 //! Both live under `HKCU\SOFTWARE\<vendor>\BDS\<version>`. That root is
 //! modelled explicitly ([`IdeRegistryRoot`]) because it is not a constant:
-//! the vendor segment changed with the product's owner, and RAD Studio can
-//! run against an alternative key (`bds.exe -r<Key>`) so that one
-//! installation serves several component sets. Everything here degrades
-//! gracefully: a missing key yields empty data plus a warning from the
-//! caller rather than an error, and non-Windows builds compile to stubs.
+//! the vendor segment changed with the product's owner. Everything here
+//! degrades gracefully: a missing key yields empty data plus a warning from
+//! the caller rather than an error, and non-Windows builds compile to stubs.
 
 /// Where one Delphi installation keeps its IDE settings in `HKCU`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,9 +15,6 @@ pub struct IdeRegistryRoot {
     /// `Borland` up to BDS 5.0 (Delphi 2007), `CodeGear` for 6.0/7.0
     /// (2009/2010), `Embarcadero` from 8.0 (XE) onwards.
     pub vendor: &'static str,
-    /// The key under the vendor: `BDS` by default. This is the segment an
-    /// IDE started with `-r<Key>` replaces.
-    pub key: String,
     /// The BDS version segment, e.g. `23.0` for Delphi 12 Athens.
     pub version: String,
 }
@@ -38,7 +33,6 @@ impl IdeRegistryRoot {
         };
         IdeRegistryRoot {
             vendor,
-            key: "BDS".to_string(),
             version: format!("{major}.0"),
         }
     }
@@ -50,7 +44,7 @@ impl IdeRegistryRoot {
 
     /// The path below `HKEY_CURRENT_USER`, e.g. `SOFTWARE\Embarcadero\BDS\23.0`.
     pub fn key_path(&self) -> String {
-        format!(r"SOFTWARE\{}\{}\{}", self.vendor, self.key, self.version)
+        format!(r"SOFTWARE\{}\BDS\{}", self.vendor, self.version)
     }
 
     /// The `Library\<platform>` settings of this installation.
@@ -142,12 +136,5 @@ mod tests {
         assert_eq!(IdeRegistryRoot::for_bds_version(5).key_path(), r"SOFTWARE\Borland\BDS\5.0");
         assert_eq!(IdeRegistryRoot::for_bds_version(7).key_path(), r"SOFTWARE\CodeGear\BDS\7.0");
         assert_eq!(IdeRegistryRoot::for_version_string("23.0").key_path(), r"SOFTWARE\Embarcadero\BDS\23.0");
-    }
-
-    #[test]
-    fn a_custom_key_replaces_the_bds_segment() {
-        let mut root = IdeRegistryRoot::for_bds_version(23);
-        root.key = "VegaBranchX".to_string();
-        assert_eq!(root.key_path(), r"SOFTWARE\Embarcadero\VegaBranchX\23.0");
     }
 }
