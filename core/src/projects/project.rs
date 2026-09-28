@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use anyhow::Result;
 use std::path::PathBuf;
 use crate::projects::*;
-use crate::files::dproj::{find_dproj_file, get_main_source, get_exe_path, get_exe_path_for};
+use crate::files::dproj::{find_dproj_file, get_main_source};
 use crate::utils::normalize_path;
 
 /// Build configurations offered for a bare-source project (no `.dproj`).
@@ -193,28 +193,15 @@ impl Project {
                 self.dpk = None;
                 // Resolve the exe path, respecting any config/platform overrides.
                 // When only one is provided, fill the other from the dproj defaults.
-                let exe_result = if config.is_some() || platform.is_some() {
-                    let dproj = dproj_rs::Dproj::from_file(&dproj_path)
-                        .map_err(|e| anyhow::anyhow!("Failed to parse dproj: {}", e))?;
-                    let cfg = config
-                        .map(|s| s.to_string())
-                        .or_else(|| dproj.active_configuration().ok())
-                        .unwrap_or_else(|| "Debug".to_string());
-                    let plat = platform
-                        .map(|s| s.to_string())
-                        .or_else(|| dproj.active_platform().ok())
-                        .unwrap_or_else(|| "Win32".to_string());
-                    get_exe_path_for(&dproj_path, &cfg, &plat)
-                } else {
-                    get_exe_path(&dproj_path)
-                };
-                if let Ok(exe_path) = exe_result {
-                    let exe_file_name = exe_path;
-                    self.exe = Some(exe_file_name.to_string_lossy().to_string());
-                    self.ini = Some(exe_file_name.with_extension("ini").to_string_lossy().to_string());
-                } else {
-                    self.exe = None;
-                    self.ini = None;
+                match Self::discover_exe(&dproj_path, config, platform, &self.directory, ide_env)? {
+                    Some(exe_path) => {
+                        self.exe = Some(exe_path.to_string_lossy().to_string());
+                        self.ini = Some(exe_path.with_extension("ini").to_string_lossy().to_string());
+                    }
+                    _ => {
+                        self.exe = None;
+                        self.ini = None;
+                    }
                 }
                 (self.dproj_run_params, self.dproj_host_application) =
                     Self::discover_debugger_settings(&dproj_path, config, platform, &self.directory, ide_env);
@@ -271,14 +258,44 @@ impl Project {
         (run_params, host_application)
     }
 
+    /// The executable the dproj builds for the given config/platform override
+    /// (or its own defaults), evaluated with the same environment as the
+    /// debugger settings, so an output directory under `$(VEGADIR)` resolves
+    /// like the host application does. `None` when the dproj names no
+    /// output, or when its path depends on a `$(NAME)` nothing defines: that
+    /// is not a path, and must not pass for one.
+    fn discover_exe(
+        dproj_path: &PathBuf,
+        config: Option<&str>,
+        platform: Option<&str>,
+        project_directory: &str,
+        ide_env: &[(String, String)],
+    ) -> Result<Option<PathBuf>> {
+        let explicit = config.is_some() || platform.is_some();
+        let dproj = match Self::load_dproj_with_ide_environment(dproj_path, project_directory, ide_env) {
+            Some(dproj) => dproj,
+            _ if explicit => anyhow::bail!("Failed to parse dproj: {}", dproj_path.display()),
+            _ => return Ok(None),
+        };
+        let (cfg, plat) = Self::effective_cfg_plat(&dproj, config, platform);
+        let exe = dproj
+            .get_exe_path_for(&cfg, &plat)
+            .ok()
+            .map(normalize_path)
+            .filter(|exe| !crate::files::dproj::has_unresolved_macro(&exe.to_string_lossy()));
+        Ok(exe)
+    }
+
     /// Parse a `.dproj` seeding the `$(NAME)` expansion map with everything
     /// the IDE-launched MSBuild would see: the process environment first,
     /// overridden by the Delphi IDE's own environment-variable overrides
     /// (`ide_env` — they exist only inside the IDE's process, so they are
     /// read back from the registry of the relevant compiler configuration),
     /// plus the project-context properties (`ProjectDir`, `ProjectName`)
-    /// that dproj-rs cannot derive on its own. Names that resolve to nothing
-    /// expand to an empty string, matching MSBuild semantics.
+    /// that dproj-rs cannot derive on its own. Names are matched whatever
+    /// their casing, and one that resolves to nothing stays in the value as
+    /// `$(NAME)` rather than vanishing from it — see
+    /// [`crate::files::dproj::seed_environment`].
     fn load_dproj_with_ide_environment(
         dproj_path: &PathBuf,
         project_directory: &str,
@@ -294,7 +311,7 @@ impl Project {
             .unwrap_or_default();
         env.insert("ProjectDir".to_string(), project_directory.to_string());
         env.insert("ProjectName".to_string(), project_name);
-        dproj_rs::DprojBuilder::new().env(env).from_file(dproj_path).ok()
+        crate::files::dproj::load_with_environment(dproj_path, env).ok()
     }
 
     /// Resolve a discovered host-application path against the project
