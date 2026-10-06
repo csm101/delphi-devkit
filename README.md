@@ -337,15 +337,18 @@ resolves it by asking DDK for the project's debug target through the
 `ddk.debug.getDebugTarget` command (`executeCommand` with
 `{ project?, compiler?, config?, platform? }`, all optional).
 
-A launch first compiles the project for debugging
-(`ddk.debug.compileBeforeDebug`, on by default), **however the session was
-started**: the context menu, the debug dropdown, a `launch.json` entry naming
-a `ddkProject`, or F5 repeating the last session after an edit. The session
-starts only when that build succeeded; a build you cancel cancels the session
-without an error. An attach never compiles, and when several instances of the
-executable are running the debugger's own process picker chooses. Every
-project is offered, built or not, since a launch builds it. DDK never writes a
-`launch.json`.
+By default a session starts on the binaries as they are: compile when you
+know it is needed (*Compile for Debugging*, or Ctrl+F9). F5 with no
+`launch.json` debugs DDK's active project. With `ddk.debug.compileBeforeDebug`
+on, every launch first compiles the project for debugging, **however the
+session was started**: the context menu, the debug dropdown, a `launch.json`
+entry naming a `ddkProject`, or F5. The session then starts only when that
+build succeeded; a build you cancel cancels the session without an error. The
+setting is off by default because a DDK compile always cleans first, so it
+would rebuild the whole project for every session. An attach never compiles,
+and when several instances of the executable are running the debugger's own
+process picker chooses. Every project is offered, built or not. DDK never
+writes a `launch.json`.
 
 ## Demos
 

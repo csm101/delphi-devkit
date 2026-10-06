@@ -116,5 +116,5 @@ function whyNotStarted(project: string, outcome: CompileOutcome | undefined): st
 }
 
 function compileBeforeDebug(): boolean {
-  return workspace.getConfiguration(DEBUG.CONFIG.KEY).get<boolean>(DEBUG.CONFIG.COMPILE_BEFORE_DEBUG, true);
+  return workspace.getConfiguration(DEBUG.CONFIG.KEY).get<boolean>(DEBUG.CONFIG.COMPILE_BEFORE_DEBUG, false);
 }
