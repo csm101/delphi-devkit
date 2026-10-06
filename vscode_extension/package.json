@@ -271,7 +271,7 @@
       {
         "command": "ddk.projects.compileSelectedProjectForDebugging",
         "title": "Compile Selected Project for Debugging",
-        "when": "ddk:isProjectSelected == true",
+        "enablement": "ddk:isProjectSelected == true",
         "category": "DDK"
       },
       {
@@ -1154,7 +1154,7 @@
       {
         "command": "ddk.debug.debugSelectedProject",
         "key": "ctrl+alt+f9",
-        "when": "ddk:debuggerAvailable == true && ddk:isProjectSelected == true && ddk:doesSelectedProjectHaveExe == true"
+        "when": "ddk:debuggerAvailable == true && ddk:isProjectSelected == true"
       },
       {
         "command": "ddk.quickPickProject",

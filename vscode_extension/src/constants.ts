@@ -189,7 +189,7 @@ export namespace DEBUG {
     export const ATTACH_PROJECT = 'ddk.debug.attachProject';
     export const DEBUG_SELECTED_PROJECT = 'ddk.debug.debugSelectedProject';
     export const ATTACH_SELECTED_PROJECT = 'ddk.debug.attachSelectedProject';
-    /** Public API for other extensions: `executeCommand(id, { project?, compiler? })` returns the `DebugTarget`. */
+    /** Public API for other extensions: `executeCommand(id, { project?, compiler?, config?, platform? })` returns the `DebugTarget`. */
     export const GET_DEBUG_TARGET = 'ddk.debug.getDebugTarget';
   }
   export namespace CONTEXT {

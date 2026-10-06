@@ -10,6 +10,7 @@ import { existsSync } from 'fs';
 import { CompilerOutputDefinitionProvider } from './projects/compiler/language';
 import { MergedDiagnostics } from './delphilsp/mergedDiagnostics';
 import { PROJECTS } from './constants';
+import { CompileOutcome, compileOutcomeOf, DebugTarget, isDebugTarget } from './debug/contract';
 
 /**
  * The fields `UpdateProject` accepts server-side — the mirror of Rust's
@@ -123,32 +124,7 @@ export interface DelphiLspConfigResult {
     warnings: string[];
 }
 
-/** Mirrors `ddk_core::debug_target::DebugTarget` — the reply of `debug/target`. */
-/** The reply to `projects/compile`: the build's outcome, once it has run. */
-export interface CompileOutcome {
-    success: boolean;
-    cancelled: boolean;
-}
-
-export interface DebugTarget {
-    project_id: number | null;
-    project: string;
-    project_file: string;
-    main_source: string | null;
-    kind: 'program' | 'package' | 'library';
-    executable: string;
-    host_application: string | null;
-    compiler: string;
-    config: string;
-    platform: string;
-    bitness: number | null;
-    symbols: { map: string; rsm: string };
-    source_root: string;
-    source_search_paths: string[];
-    modules: { name: string; binary: string | null; map: string | null; rsm: string | null; dcp: string | null }[];
-    args: string[];
-    warnings: string[];
-}
+export type { CompileOutcome, DebugTarget } from './debug/contract';
 
 export class DDK_Client {
     private client: LanguageClient;
@@ -320,17 +296,40 @@ export class DDK_Client {
     }
 
     /**
-     * Runs one `projects/compile` request and resolves to whether the build
-     * succeeded. The server answers only once the compiler is done, and its
-     * reply carries the outcome; the event only keeps the request's lifetime
-     * visible to `Runtime` (it cannot fail a compile: the server finishes it
-     * whatever the compiler said).
+     * Compiles one project and resolves to the build's outcome — success,
+     * failure or cancellation — for a caller that acts on the difference.
+     * `undefined` when the server reported none (a `ddk-server` older than
+     * this extension).
      */
+    public async compileProjectForOutcome(
+        rebuild: boolean, projectId: number, projectLinkId?: number, debugInfo: boolean = false
+    ): Promise<CompileOutcome | undefined> {
+        return await this.compileForOutcome({
+            type: 'Project',
+            project_id: projectId,
+            project_link_id: projectLinkId,
+            rebuild: rebuild,
+            debug_info: debugInfo,
+        });
+    }
+
+    /** Whether the build succeeded; an outcome the server did not report counts as a failure. */
     private async compile(params: Record<string, unknown>): Promise<boolean> {
+        return (await this.compileForOutcome(params))?.success === true;
+    }
+
+    /**
+     * Runs one `projects/compile` request. The server answers only once the
+     * compiler is done, and its reply carries the outcome; the event only
+     * keeps the request's lifetime visible to `Runtime` (it cannot fail a
+     * compile: the server finishes it whatever the compiler said). The reply
+     * is checked, not trusted: see `compileOutcomeOf`.
+     */
+    private async compileForOutcome(params: Record<string, unknown>): Promise<CompileOutcome | undefined> {
         const event = Runtime.addEvent(0);
-        const outcome: CompileOutcome = await this.client.sendRequest('projects/compile', { ...params, event_id: event });
+        const reply: unknown = await this.client.sendRequest('projects/compile', { ...params, event_id: event });
         await Runtime.waitForEvent(event);
-        return outcome.success;
+        return compileOutcomeOf(reply);
     }
 
     public async cancelCompilation(): Promise<void> {
@@ -350,12 +349,15 @@ export class DDK_Client {
 
     /** Thin wrapper over the `debug/target` custom method. `project` is a project id
      *  (as a string), name, or path — omit to target the currently active project.
-     *  Throws (with the candidate list as the message) when the reference is ambiguous. */
-    /** `config`/`platform` describe those instead of the project's active
-     *  ones — the same overrides `ddk debug-target` and `ddk compile` take;
-     *  nothing is persisted. */
+     *  `config`/`platform` describe those instead of the project's active ones —
+     *  the same overrides `ddk debug-target` and `ddk compile` take; nothing is
+     *  persisted. Throws (with the candidate list as the message) when the
+     *  reference is ambiguous, and when the reply is not a debug target. */
     public async debugTarget(project?: string, compiler?: string, config?: string, platform?: string): Promise<DebugTarget> {
-        return await this.client.sendRequest('debug/target', { project, compiler, config, platform });
+        const reply: unknown = await this.client.sendRequest('debug/target', { project, compiler, config, platform });
+        if (!isDebugTarget(reply))
+            throw new Error('The DDK server did not answer with a debug target (is it older than the extension?).');
+        return reply;
     }
 
     public onCompilerProgress(params: CompilerProgressParams) {
