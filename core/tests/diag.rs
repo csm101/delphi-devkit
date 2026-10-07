@@ -57,11 +57,11 @@ fn parses_fatal_error() {
 
 #[test]
 fn parses_delphi2007_msbuild_wrapper_format() {
-    let line = r"C:\WINDOWS\Microsoft.NET\Framework\v2.0.50727\Borland.Delphi.Targets : warning : C:\Delphi\VSS\BeasJSONMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden [c:\Delphi\VSS\be.dproj]";
+    let line = r"C:\WINDOWS\Microsoft.NET\Framework\v2.0.50727\Borland.Delphi.Targets : warning : C:\Projects\Sample\SampleMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden [c:\Projects\Sample\Sample.dproj]";
     let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into());
     assert!(diag.is_some());
     let diag = diag.unwrap();
-    assert_eq!(diag.file, r"C:\Delphi\VSS\BeasJSONMessage.pas");
+    assert_eq!(diag.file, r"C:\Projects\Sample\SampleMessage.pas");
     assert_eq!(diag.line, 107);
     assert_eq!(diag.column, None);
     assert_eq!(diag.code, "W1036");
@@ -70,14 +70,151 @@ fn parses_delphi2007_msbuild_wrapper_format() {
 
 #[test]
 fn parses_delphi2007_simple_indented_format() {
-    let line = "  C:\\Delphi\\VSS\\BeasJSONMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden";
+    let line = "  C:\\Projects\\Sample\\SampleMessage.pas(107) Warnung: W1036 Variable 'aHelpContext' ist moeglicherweise nicht initialisiert worden";
     let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into());
     assert!(diag.is_some());
     let diag = diag.unwrap();
-    assert_eq!(diag.file, r"C:\Delphi\VSS\BeasJSONMessage.pas");
+    assert_eq!(diag.file, r"C:\Projects\Sample\SampleMessage.pas");
     assert_eq!(diag.line, 107);
     assert_eq!(diag.code, "W1036");
     assert_eq!(format!("{}", diag.kind), "WARN");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CompilerLineDiagnostic::from_line – native dcc output (Delphi 12)
+//  The severity label is localized and glued to the closing parenthesis, and the
+//  message code carries no trailing colon.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn parses_delphi12_german_warning_with_glued_label() {
+    let line = "  C:\\Projects\\Sample\\Source\\Framework\\SampleLibrary.pas(205)Warnung: W1057 Implizite String-Umwandlung von 'AnsiString' zu 'WideString'";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(
+        diag.file,
+        "C:\\Projects\\Sample\\Source\\Framework\\SampleLibrary.pas"
+    );
+    assert_eq!(diag.line, 205);
+    assert_eq!(diag.column, None);
+    assert_eq!(diag.code, "W1057");
+    assert_eq!(format!("{}", diag.kind), "WARN");
+    assert_eq!(
+        diag.message,
+        "Implizite String-Umwandlung von 'AnsiString' zu 'WideString'"
+    );
+}
+
+#[test]
+fn parses_delphi12_german_hint_with_glued_label() {
+    let line = "  C:\\Projects\\Sample\\Source\\Components\\SampleHelper.pas(47)Hinweis: H2219 Das private-Symbol 'fSampleProvider' wurde deklariert, aber nie verwendet";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(
+        diag.file,
+        "C:\\Projects\\Sample\\Source\\Components\\SampleHelper.pas"
+    );
+    assert_eq!(diag.line, 47);
+    assert_eq!(diag.code, "H2219");
+    assert_eq!(format!("{}", diag.kind), "HINT");
+    assert_eq!(
+        diag.message,
+        "Das private-Symbol 'fSampleProvider' wurde deklariert, aber nie verwendet"
+    );
+}
+
+#[test]
+fn parses_delphi12_english_warning_with_glued_label() {
+    let line = "  C:\\Projects\\Unit1.pas(205)Warning: W1057 Implicit string cast from 'AnsiString' to 'WideString'";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\Projects\Unit1.pas");
+    assert_eq!(diag.line, 205);
+    assert_eq!(diag.code, "W1057");
+    assert_eq!(format!("{}", diag.kind), "WARN");
+}
+
+#[test]
+fn parses_native_format_with_column_and_multiword_label() {
+    let line = "  C:\\Projects\\Unit1.pas(12,7)Schwerwiegender Fehler: F2063 Erforderliche Datei nicht gefunden";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\Projects\Unit1.pas");
+    assert_eq!(diag.line, 12);
+    assert_eq!(diag.column, Some(7));
+    assert_eq!(diag.code, "F2063");
+    assert_eq!(format!("{}", diag.kind), "ERROR");
+}
+
+#[test]
+fn parses_native_format_with_relative_path_and_no_indent() {
+    // dcc32 invoked directly (bare .dpr build) prints the path as given, unindented.
+    let line = "src\\Unit1.pas(9)Hinweis: H2164 Variable 'x' wurde deklariert, aber nie verwendet";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"src\Unit1.pas");
+    assert_eq!(diag.line, 9);
+    assert_eq!(diag.code, "H2164");
+    assert_eq!(format!("{}", diag.kind), "HINT");
+}
+
+#[test]
+fn parses_path_containing_parentheses() {
+    let line = "  C:\\Program Files (x86)\\Proj\\Unit1.pas(205)Warnung: W1057 Implizite String-Umwandlung";
+    let diag = CompilerLineDiagnostic::from_line(line, "dcc32".into()).unwrap();
+    assert_eq!(diag.file, r"C:\Program Files (x86)\Proj\Unit1.pas");
+    assert_eq!(diag.line, 205);
+    assert_eq!(diag.code, "W1057");
+}
+
+#[test]
+fn native_and_msbuild_form_share_the_dedup_key() {
+    // compiler/mod.rs deduplicates consecutive diagnostics by (file, line, code).
+    // Both spellings of the same diagnostic must therefore produce the same key,
+    // so a build that emits it twice still yields one diagnostic.
+    let native = "  C:\\Projects\\Unit1.pas(205)Warnung: W1057 Implizite String-Umwandlung von 'AnsiString' zu 'WideString'";
+    let msbuild = r"C:\Projects\Unit1.pas(205,12): warning W1057: Implizite String-Umwandlung von 'AnsiString' zu 'WideString' [C:\Projects\MyProject.dproj]";
+    let a = CompilerLineDiagnostic::from_line(native, "dcc32".into()).unwrap();
+    let b = CompilerLineDiagnostic::from_line(msbuild, "dcc32".into()).unwrap();
+    assert_eq!((&a.file, a.line, &a.code), (&b.file, b.line, &b.code));
+    // The column is part of neither the key nor the equality above.
+    assert_eq!(a.column, None);
+    assert_eq!(b.column, Some(12));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  False-alarm guards: MSBuild's own messages are not Delphi diagnostics
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn rejects_msbuild_own_warning_with_msb_code() {
+    let line = r#"Sample\D12\Sample.dproj(202,5): warning MSB4011: "C:\Program Files (x86)\Embarcadero\Studio\23.0\bin\CodeGear.Delphi.Targets" kann nicht erneut importiert werden."#;
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_msbuild_own_error_with_msb_code() {
+    let line = r"MSBUILD : error MSB1009: Projektdatei nicht vorhanden.";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_path_only_progress_line() {
+    let line = "  C:\\Projects\\Sample\\Source\\Framework\\SampleLibrary";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_path_with_line_number_but_no_message() {
+    let line = "  C:\\Projects\\Sample\\Unit1.pas(205)";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_label_without_message_code() {
+    let line = "  C:\\Projects\\Sample\\Unit1.pas(205)Warnung: etwas ist passiert";
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
+}
+
+#[test]
+fn rejects_msbuild_progress_line() {
+    let line = r#"Der Buildvorgang fuer das Projekt "C:\Projects\Sample\D12\Sample.dproj" wurde beendet (Clean;Build Ziele)."#;
+    assert!(CompilerLineDiagnostic::from_line(line, "dcc32".into()).is_none());
 }
 
 #[test]

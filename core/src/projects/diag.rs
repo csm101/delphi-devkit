@@ -6,13 +6,31 @@ use std::fmt::Display;
 // <file>(<line>[,<col>]): (error|warning|hint|fatal) <CODE>: <message> [<project>]
 const MSBUILD_OUTPUT_REGEX: &str = r"^(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]:\s+(?P<kind>.*?)\s+(?P<code>[A-Z]\d+):\s+(?P<message>.*?)(?:\s+\[.*\])?$";
 
-// Delphi 2007 / Borland MSBuild wrapper format:
-// <target_file> : (warning|error|hint|fatal) : <source_file>(<line>) <localized_label>: <CODE> <message> [<project>]
-const DELPHI2007_MSBUILD_REGEX: &str = r"^.*?\s+:\s+(?:warning|error|hint|fatal)\s+:\s+(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]\s+\S+\s+(?P<code>[A-Z]\d+)\s+(?P<message>.*?)(?:\s+\[.*\])?$";
+// Tail shared by the two native-dcc formats below, starting after the closing
+// parenthesis of the line/column notation:
+//   [whitespace]<localized_label>: <CODE> <message>[ [<project>]]
+//
+// The label is the compiler's localized severity word ("Warning:", "Warnung:",
+// "Hinweis:", "Fatal Error:"). It is therefore matched as "letters and spaces",
+// never by a fixed word list, and the severity is derived from <CODE> alone.
+// Delphi 2007 separates the label from the parenthesis by a space, Delphi 12
+// glues it on ("...pas(205)Warnung: W1057 ..."), so the separator is optional.
+// The label itself is optional too, but it can never start with ':' – that keeps
+// this tail disjoint from the MSBuild format above ("...pas(205): warning W1057:"),
+// whose code is followed by a colon and can never satisfy "<CODE><space>".
+const DCC_NATIVE_TAIL: &str = r"\s*(?:\p{L}[\p{L} ]*)?:\s*(?P<code>[A-Z]\d+)\s+(?P<message>\S.*?)(?:\s+\[[^\]]*\])?\s*$";
 
-// Delphi 2007 simple / duplicate format (indented line, no MSBuild wrapper):
-//   <source_file>(<line>) <localized_label>: <CODE> <message>
-const DELPHI2007_SIMPLE_REGEX: &str = r"^\s+(?P<file>[A-Za-z]:\\[^(]*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]\s+\S+\s+(?P<code>[A-Z]\d+)\s+(?P<message>.*)$";
+// Delphi 2007 / Borland MSBuild wrapper format:
+// <target_file> : (warning|error|hint|fatal) : <source_file>(<line>)<tail>
+const DELPHI2007_MSBUILD_PREFIX: &str =
+    r"^.*?\s+:\s+(?:warning|error|hint|fatal)\s+:\s+(?P<file>.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
+
+// Native compiler output without MSBuild wrapper (Delphi 2007 duplicate line as
+// well as the Delphi 12 dcc output MSBuild passes through verbatim), optionally
+// indented:
+//   <source_file>(<line>[,<col>])<tail>
+const DCC_NATIVE_PREFIX: &str =
+    r"^\s*(?P<file>\S.*?)[(](?P<line>\d+)(?:,(?P<column>\d+))?[)]";
 
 #[derive(Debug)]
 pub enum DiagnosticKind {
@@ -66,8 +84,10 @@ impl Display for CompilerLineDiagnostic {
 
 lazy_static::lazy_static! {
     pub static ref COMPILER_OUTPUT_REGEX: regex::Regex = regex::Regex::new(MSBUILD_OUTPUT_REGEX).unwrap();
-    static ref DELPHI2007_MSBUILD_OUTPUT_REGEX: regex::Regex = regex::Regex::new(DELPHI2007_MSBUILD_REGEX).unwrap();
-    static ref DELPHI2007_SIMPLE_OUTPUT_REGEX: regex::Regex = regex::Regex::new(DELPHI2007_SIMPLE_REGEX).unwrap();
+    static ref DELPHI2007_MSBUILD_OUTPUT_REGEX: regex::Regex =
+        regex::Regex::new(&format!("{DELPHI2007_MSBUILD_PREFIX}{DCC_NATIVE_TAIL}")).unwrap();
+    static ref DCC_NATIVE_OUTPUT_REGEX: regex::Regex =
+        regex::Regex::new(&format!("{DCC_NATIVE_PREFIX}{DCC_NATIVE_TAIL}")).unwrap();
 }
 
 fn build_from_captures(captures: regex::Captures, compiler_name: String) -> Option<CompilerLineDiagnostic> {
@@ -103,7 +123,14 @@ impl CompilerLineDiagnostic {
     /// Attempts three formats in order:
     /// 1. Standard MSBuild / dcc32 format
     /// 2. Delphi 2007 Borland.Delphi.Targets MSBuild wrapper
-    /// 3. Delphi 2007 indented simple / duplicate format
+    /// 3. Native dcc output (Delphi 2007 duplicate line, Delphi 12 pass-through)
+    ///
+    /// The wrapper format is tried before the native one because its line also
+    /// ends in the native shape – matching natively first would make the file
+    /// capture swallow the `<target> : warning : ` prefix.
+    ///
+    /// The severity is always derived from the message code, never from the
+    /// label, which the compiler emits in the IDE's UI language.
     pub fn from_line(line: &str, compiler_name: String) -> Option<Self> {
         if let Some(captures) = COMPILER_OUTPUT_REGEX.captures(line) {
             return build_from_captures(captures, compiler_name);
@@ -111,7 +138,7 @@ impl CompilerLineDiagnostic {
         if let Some(captures) = DELPHI2007_MSBUILD_OUTPUT_REGEX.captures(line) {
             return build_from_captures(captures, compiler_name);
         }
-        if let Some(captures) = DELPHI2007_SIMPLE_OUTPUT_REGEX.captures(line) {
+        if let Some(captures) = DCC_NATIVE_OUTPUT_REGEX.captures(line) {
             return build_from_captures(captures, compiler_name);
         }
         None
